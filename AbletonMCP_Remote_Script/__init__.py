@@ -7,12 +7,18 @@ import json
 import threading
 import time
 import traceback
+import os
 
 # Change queue import for Python 2
 try:
     import Queue as queue  # Python 2
 except ImportError:
     import queue  # Python 3
+
+try:
+    string_types = (basestring,)
+except NameError:
+    string_types = (str,)
 
 # Constants for socket communication
 DEFAULT_PORT = 9877
@@ -225,6 +231,15 @@ class AbletonMCP(ControlSurface):
             elif command_type == "get_track_info":
                 track_index = params.get("track_index", 0)
                 response["result"] = self._get_track_info(track_index)
+            elif command_type == "list_arrangement_clips":
+                track_index = params.get("track_index", 0)
+                response["result"] = self._list_arrangement_clips(track_index)
+            elif command_type == "get_arrangement_clip_source_path":
+                track_index = params.get("track_index", 0)
+                clip_index = params.get("clip_index", 0)
+                response["result"] = self._get_arrangement_clip_source_path(track_index, clip_index)
+            elif command_type == "get_detail_clip_source_path":
+                response["result"] = self._get_detail_clip_source_path()
             # Commands that modify Live's state should be scheduled on the main thread
             elif command_type in ["create_midi_track", "set_track_name", 
                                  "create_clip", "add_notes_to_clip", "set_clip_name", 
@@ -413,6 +428,263 @@ class AbletonMCP(ControlSurface):
         except Exception as e:
             self.log_message("Error getting track info: " + str(e))
             raise
+
+    def _get_song(self):
+        """Return the current song object."""
+        try:
+            song = self.song()
+            if song is not None:
+                self._song = song
+                return song
+        except Exception:
+            pass
+        return self._song
+
+    def _to_list(self, value):
+        """Convert Live vectors/iterables into a Python list."""
+        if value is None:
+            return None
+        if isinstance(value, string_types):
+            return None
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+
+        try:
+            return list(value)
+        except Exception:
+            pass
+
+        try:
+            length = len(value)
+            return [value[index] for index in range(length)]
+        except Exception:
+            return None
+
+    def _probe_chain(self, root, chain):
+        """Probe nested attributes/dict keys defensively."""
+        current = root
+        for key in chain:
+            if current is None:
+                return None
+
+            if isinstance(current, dict):
+                if key not in current:
+                    return None
+                current = current.get(key)
+                continue
+
+            if not hasattr(current, key):
+                return None
+            try:
+                current = getattr(current, key)
+            except Exception:
+                return None
+
+        return current
+
+    def _clip_metadata(self, clip, clip_index):
+        """Return JSON-safe arrangement clip metadata."""
+        metadata = {
+            "clip_index": clip_index,
+            "clip_name": None,
+            "is_audio_clip": None,
+            "is_midi_clip": None
+        }
+
+        try:
+            metadata["clip_name"] = getattr(clip, "name", None)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(clip, "is_audio_clip"):
+                metadata["is_audio_clip"] = bool(getattr(clip, "is_audio_clip"))
+        except Exception:
+            pass
+
+        try:
+            if hasattr(clip, "is_midi_clip"):
+                metadata["is_midi_clip"] = bool(getattr(clip, "is_midi_clip"))
+        except Exception:
+            pass
+
+        return metadata
+
+    def _resolve_file_path_from_clip(self, clip):
+        """Best-effort clip source path probing."""
+        path_chains = [
+            ("clip.file_path", ["file_path"]),
+            ("clip.sample.file_path", ["sample", "file_path"]),
+            ("clip.sample_path", ["sample_path"]),
+            ("clip.path", ["path"]),
+            ("clip.sample.filepath", ["sample", "filepath"])
+        ]
+
+        file_path = None
+        debug_tried = []
+        debug_found_at = None
+
+        for chain_name, chain_keys in path_chains:
+            debug_tried.append(chain_name)
+            probed = self._probe_chain(clip, chain_keys)
+            if isinstance(probed, string_types):
+                probed = probed.strip()
+                if probed:
+                    file_path = probed
+                    debug_found_at = chain_name
+                    break
+
+        exists_on_disk = None
+        if file_path:
+            try:
+                if os.path.isabs(file_path):
+                    exists_on_disk = os.path.exists(file_path)
+            except Exception:
+                exists_on_disk = None
+
+        return {
+            "file_path": file_path,
+            "exists_on_disk": exists_on_disk,
+            "debug_tried": debug_tried,
+            "debug_found_at": debug_found_at
+        }
+
+    def _list_arrangement_clips(self, track_index):
+        """List arrangement clips from Track.arrangement_clips."""
+        debug = {
+            "hasattr_track_arrangement_clips": False,
+            "track_dir_clip_entries": [],
+            "exception_type": None,
+            "exception_message": None
+        }
+
+        try:
+            song = self._get_song()
+            if song is None:
+                raise RuntimeError("Could not access song")
+
+            if track_index < 0 or track_index >= len(song.tracks):
+                raise IndexError("Track index out of range")
+
+            track = song.tracks[track_index]
+            debug["hasattr_track_arrangement_clips"] = hasattr(track, "arrangement_clips")
+
+            try:
+                debug["track_dir_clip_entries"] = [entry for entry in dir(track) if "clip" in entry.lower()]
+            except Exception:
+                debug["track_dir_clip_entries"] = []
+
+            arrangement_raw = getattr(track, "arrangement_clips")
+            arrangement_clips = self._to_list(arrangement_raw)
+            if arrangement_clips is None:
+                raise TypeError("track.arrangement_clips is not list-like")
+
+            clips = []
+            for clip_index, clip in enumerate(arrangement_clips):
+                clips.append(self._clip_metadata(clip, clip_index))
+
+            return {
+                "supported": True,
+                "track_index": track_index,
+                "track_name": track.name,
+                "arrangement_clip_count": len(arrangement_clips),
+                "clips": clips
+            }
+        except Exception as e:
+            debug["exception_type"] = type(e).__name__
+            debug["exception_message"] = str(e)
+            return {
+                "supported": False,
+                "track_index": track_index,
+                "reason": "arrangement_clip_access_failed",
+                "debug": debug
+            }
+
+    def _get_arrangement_clip_source_path(self, track_index, clip_index):
+        """Get source path for a specific arrangement clip."""
+        try:
+            song = self._get_song()
+            if song is None:
+                raise RuntimeError("Could not access song")
+
+            if track_index < 0 or track_index >= len(song.tracks):
+                raise IndexError("Track index out of range")
+
+            track = song.tracks[track_index]
+            arrangement_clips = self._to_list(getattr(track, "arrangement_clips"))
+            if arrangement_clips is None:
+                raise TypeError("track.arrangement_clips is not list-like")
+
+            if clip_index < 0 or clip_index >= len(arrangement_clips):
+                raise IndexError("Clip index out of range")
+
+            clip = arrangement_clips[clip_index]
+            path_info = self._resolve_file_path_from_clip(clip)
+            clip_info = self._clip_metadata(clip, clip_index)
+
+            result = {
+                "track_index": track_index,
+                "track_name": track.name,
+                "clip_index": clip_index,
+                "clip_name": clip_info.get("clip_name"),
+                "is_audio_clip": clip_info.get("is_audio_clip"),
+                "is_midi_clip": clip_info.get("is_midi_clip"),
+                "file_path": path_info.get("file_path"),
+                "exists_on_disk": path_info.get("exists_on_disk"),
+                "debug_tried": path_info.get("debug_tried", [])
+            }
+
+            if path_info.get("debug_found_at") is not None:
+                result["debug_found_at"] = path_info.get("debug_found_at")
+
+            return result
+        except Exception as e:
+            return {
+                "error": "get_arrangement_clip_source_path_failed",
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "message": str(e),
+                "exception_type": type(e).__name__
+            }
+
+    def _get_detail_clip_source_path(self):
+        """Get source path info for the clip currently shown in Detail View."""
+        try:
+            song = self._get_song()
+            if song is None:
+                raise RuntimeError("Could not access song")
+
+            detail_clip = getattr(song.view, "detail_clip", None)
+            if detail_clip is None:
+                return {
+                    "error": "no_detail_clip_selected",
+                    "message": "No detail clip is currently selected in Ableton Live."
+                }
+
+            clip_info = self._clip_metadata(detail_clip, 0)
+            path_info = self._resolve_file_path_from_clip(detail_clip)
+
+            result = {
+                "clip_name": clip_info.get("clip_name"),
+                "is_audio_clip": clip_info.get("is_audio_clip"),
+                "is_midi_clip": clip_info.get("is_midi_clip"),
+                "file_path": path_info.get("file_path"),
+                "exists_on_disk": path_info.get("exists_on_disk"),
+                "debug_tried": path_info.get("debug_tried", [])
+            }
+
+            if path_info.get("debug_found_at") is not None:
+                result["debug_found_at"] = path_info.get("debug_found_at")
+
+            return result
+        except Exception as e:
+            return {
+                "error": "get_detail_clip_source_path_failed",
+                "message": str(e),
+                "exception_type": type(e).__name__
+            }
     
     def _create_midi_track(self, index):
         """Create a new MIDI track at the specified index"""
