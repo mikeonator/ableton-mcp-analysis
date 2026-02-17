@@ -7,12 +7,18 @@ import json
 import threading
 import time
 import traceback
+import os
 
 # Change queue import for Python 2
 try:
     import Queue as queue  # Python 2
 except ImportError:
     import queue  # Python 3
+
+try:
+    string_types = (basestring,)
+except NameError:
+    string_types = (str,)
 
 # Constants for socket communication
 DEFAULT_PORT = 9877
@@ -225,6 +231,24 @@ class AbletonMCP(ControlSurface):
             elif command_type == "get_track_info":
                 track_index = params.get("track_index", 0)
                 response["result"] = self._get_track_info(track_index)
+            elif command_type == "list_arrangement_clips":
+                track_index = params.get("track_index", 0)
+                response["result"] = self._list_arrangement_clips(track_index)
+            elif command_type == "get_arrangement_clip_source_path":
+                track_index = params.get("track_index", 0)
+                clip_index = params.get("clip_index", 0)
+                response["result"] = self._get_arrangement_clip_source_path(track_index, clip_index)
+            elif command_type == "get_detail_clip_source_path":
+                response["result"] = self._get_detail_clip_source_path()
+            elif command_type == "get_track_devices":
+                track_index = params.get("track_index", 0)
+                response["result"] = self._get_track_devices(track_index)
+            elif command_type == "get_device_parameters":
+                track_index = params.get("track_index", 0)
+                device_index = params.get("device_index", 0)
+                offset = params.get("offset", 0)
+                limit = params.get("limit", 64)
+                response["result"] = self._get_device_parameters(track_index, device_index, offset, limit)
             # Commands that modify Live's state should be scheduled on the main thread
             elif command_type in ["create_midi_track", "set_track_name", 
                                  "create_clip", "add_notes_to_clip", "set_clip_name", 
@@ -413,6 +437,604 @@ class AbletonMCP(ControlSurface):
         except Exception as e:
             self.log_message("Error getting track info: " + str(e))
             raise
+
+    def _get_song(self):
+        """Return the current song object."""
+        try:
+            song = self.song()
+            if song is not None:
+                self._song = song
+                return song
+        except Exception:
+            pass
+        return self._song
+
+    def _to_list(self, value):
+        """Convert Live vectors/iterables into a Python list."""
+        if value is None:
+            return None
+        if isinstance(value, string_types):
+            return None
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+
+        try:
+            return list(value)
+        except Exception:
+            pass
+
+        try:
+            length = len(value)
+            return [value[index] for index in range(length)]
+        except Exception:
+            return None
+
+    def _probe_chain(self, root, chain):
+        """Probe nested attributes/dict keys defensively."""
+        current = root
+        for key in chain:
+            if current is None:
+                return None
+
+            if isinstance(current, dict):
+                if key not in current:
+                    return None
+                current = current.get(key)
+                continue
+
+            if not hasattr(current, key):
+                return None
+            try:
+                current = getattr(current, key)
+            except Exception:
+                return None
+
+        return current
+
+    def _clip_metadata(self, clip, clip_index):
+        """Return JSON-safe arrangement clip metadata."""
+        metadata = {
+            "clip_index": clip_index,
+            "clip_name": None,
+            "is_audio_clip": None,
+            "is_midi_clip": None
+        }
+
+        try:
+            metadata["clip_name"] = getattr(clip, "name", None)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(clip, "is_audio_clip"):
+                metadata["is_audio_clip"] = bool(getattr(clip, "is_audio_clip"))
+        except Exception:
+            pass
+
+        try:
+            if hasattr(clip, "is_midi_clip"):
+                metadata["is_midi_clip"] = bool(getattr(clip, "is_midi_clip"))
+        except Exception:
+            pass
+
+        return metadata
+
+    def _resolve_file_path_from_clip(self, clip):
+        """Best-effort clip source path probing."""
+        path_chains = [
+            ("clip.file_path", ["file_path"]),
+            ("clip.sample.file_path", ["sample", "file_path"]),
+            ("clip.sample_path", ["sample_path"]),
+            ("clip.path", ["path"]),
+            ("clip.sample.filepath", ["sample", "filepath"])
+        ]
+
+        file_path = None
+        debug_tried = []
+        debug_found_at = None
+
+        for chain_name, chain_keys in path_chains:
+            debug_tried.append(chain_name)
+            probed = self._probe_chain(clip, chain_keys)
+            if isinstance(probed, string_types):
+                probed = probed.strip()
+                if probed:
+                    file_path = probed
+                    debug_found_at = chain_name
+                    break
+
+        exists_on_disk = None
+        if file_path:
+            try:
+                if os.path.isabs(file_path):
+                    exists_on_disk = os.path.exists(file_path)
+            except Exception:
+                exists_on_disk = None
+
+        return {
+            "file_path": file_path,
+            "exists_on_disk": exists_on_disk,
+            "debug_tried": debug_tried,
+            "debug_found_at": debug_found_at
+        }
+
+    def _list_arrangement_clips(self, track_index):
+        """List arrangement clips from Track.arrangement_clips."""
+        debug = {
+            "hasattr_track_arrangement_clips": False,
+            "track_dir_clip_entries": [],
+            "exception_type": None,
+            "exception_message": None
+        }
+
+        try:
+            song = self._get_song()
+            if song is None:
+                raise RuntimeError("Could not access song")
+
+            if track_index < 0 or track_index >= len(song.tracks):
+                raise IndexError("Track index out of range")
+
+            track = song.tracks[track_index]
+            debug["hasattr_track_arrangement_clips"] = hasattr(track, "arrangement_clips")
+
+            try:
+                debug["track_dir_clip_entries"] = [entry for entry in dir(track) if "clip" in entry.lower()]
+            except Exception:
+                debug["track_dir_clip_entries"] = []
+
+            arrangement_raw = getattr(track, "arrangement_clips")
+            arrangement_clips = self._to_list(arrangement_raw)
+            if arrangement_clips is None:
+                raise TypeError("track.arrangement_clips is not list-like")
+
+            clips = []
+            for clip_index, clip in enumerate(arrangement_clips):
+                clips.append(self._clip_metadata(clip, clip_index))
+
+            return {
+                "supported": True,
+                "track_index": track_index,
+                "track_name": track.name,
+                "arrangement_clip_count": len(arrangement_clips),
+                "clips": clips
+            }
+        except Exception as e:
+            debug["exception_type"] = type(e).__name__
+            debug["exception_message"] = str(e)
+            return {
+                "supported": False,
+                "track_index": track_index,
+                "reason": "arrangement_clip_access_failed",
+                "debug": debug
+            }
+
+    def _get_arrangement_clip_source_path(self, track_index, clip_index):
+        """Get source path for a specific arrangement clip."""
+        try:
+            song = self._get_song()
+            if song is None:
+                raise RuntimeError("Could not access song")
+
+            if track_index < 0 or track_index >= len(song.tracks):
+                raise IndexError("Track index out of range")
+
+            track = song.tracks[track_index]
+            arrangement_clips = self._to_list(getattr(track, "arrangement_clips"))
+            if arrangement_clips is None:
+                raise TypeError("track.arrangement_clips is not list-like")
+
+            if clip_index < 0 or clip_index >= len(arrangement_clips):
+                raise IndexError("Clip index out of range")
+
+            clip = arrangement_clips[clip_index]
+            path_info = self._resolve_file_path_from_clip(clip)
+            clip_info = self._clip_metadata(clip, clip_index)
+
+            result = {
+                "track_index": track_index,
+                "track_name": track.name,
+                "clip_index": clip_index,
+                "clip_name": clip_info.get("clip_name"),
+                "is_audio_clip": clip_info.get("is_audio_clip"),
+                "is_midi_clip": clip_info.get("is_midi_clip"),
+                "file_path": path_info.get("file_path"),
+                "exists_on_disk": path_info.get("exists_on_disk"),
+                "debug_tried": path_info.get("debug_tried", [])
+            }
+
+            if path_info.get("debug_found_at") is not None:
+                result["debug_found_at"] = path_info.get("debug_found_at")
+
+            return result
+        except Exception as e:
+            return {
+                "error": "get_arrangement_clip_source_path_failed",
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "message": str(e),
+                "exception_type": type(e).__name__
+            }
+
+    def _get_detail_clip_source_path(self):
+        """Get source path info for the clip currently shown in Detail View."""
+        try:
+            song = self._get_song()
+            if song is None:
+                raise RuntimeError("Could not access song")
+
+            detail_clip = getattr(song.view, "detail_clip", None)
+            if detail_clip is None:
+                return {
+                    "error": "no_detail_clip_selected",
+                    "message": "No detail clip is currently selected in Ableton Live."
+                }
+
+            clip_info = self._clip_metadata(detail_clip, 0)
+            path_info = self._resolve_file_path_from_clip(detail_clip)
+
+            result = {
+                "clip_name": clip_info.get("clip_name"),
+                "is_audio_clip": clip_info.get("is_audio_clip"),
+                "is_midi_clip": clip_info.get("is_midi_clip"),
+                "file_path": path_info.get("file_path"),
+                "exists_on_disk": path_info.get("exists_on_disk"),
+                "debug_tried": path_info.get("debug_tried", [])
+            }
+
+            if path_info.get("debug_found_at") is not None:
+                result["debug_found_at"] = path_info.get("debug_found_at")
+
+            return result
+        except Exception as e:
+            return {
+                "error": "get_detail_clip_source_path_failed",
+                "message": str(e),
+                "exception_type": type(e).__name__
+            }
+
+    def _json_scalar(self, value):
+        """Convert values into JSON-safe scalar values."""
+        if value is None:
+            return None
+
+        if isinstance(value, bool):
+            return value
+
+        if isinstance(value, (int, float)):
+            try:
+                if isinstance(value, float):
+                    if value != value:
+                        return None
+                    if value == float("inf") or value == float("-inf"):
+                        return None
+            except Exception:
+                return None
+            return value
+
+        if isinstance(value, string_types):
+            return value
+
+        try:
+            coerced = float(value)
+            if coerced != coerced:
+                return None
+            if coerced == float("inf") or coerced == float("-inf"):
+                return None
+            return coerced
+        except Exception:
+            return None
+
+    def _safe_attr(self, obj, attr_name):
+        """Best-effort attribute access."""
+        if obj is None:
+            return None
+        if not hasattr(obj, attr_name):
+            return None
+        try:
+            return getattr(obj, attr_name)
+        except Exception:
+            return None
+
+    def _resolve_track_by_index(self, track_index):
+        """Resolve and validate a track by index."""
+        try:
+            track_index = int(track_index)
+        except Exception:
+            return None, None, {
+                "ok": False,
+                "error": "invalid_track_index",
+                "message": "track_index must be an integer",
+                "track_index": track_index
+            }
+
+        song = self._get_song()
+        if song is None:
+            return None, None, {
+                "ok": False,
+                "error": "song_unavailable",
+                "message": "Could not access song",
+                "track_index": track_index
+            }
+
+        if track_index < 0 or track_index >= len(song.tracks):
+            return None, None, {
+                "ok": False,
+                "error": "invalid_track_index",
+                "message": "track_index out of range",
+                "track_index": track_index,
+                "track_count": len(song.tracks)
+            }
+
+        return song, song.tracks[track_index], None
+
+    def _extract_device_plugin_metadata(self, device):
+        """Best-effort plugin metadata extraction."""
+        class_name = self._safe_attr(device, "class_name")
+        if class_name is not None and not isinstance(class_name, string_types):
+            try:
+                class_name = str(class_name)
+            except Exception:
+                class_name = None
+
+        is_plugin = None
+        plugin_format = None
+        vendor = None
+
+        bool_keys = ["is_plugin", "is_plug_in", "is_vst", "is_au"]
+        for key in bool_keys:
+            value = self._safe_attr(device, key)
+            if isinstance(value, bool):
+                if key == "is_plugin":
+                    is_plugin = value
+                elif value:
+                    is_plugin = True
+                    if key == "is_vst" and plugin_format is None:
+                        plugin_format = "VST"
+                    elif key == "is_au" and plugin_format is None:
+                        plugin_format = "AU"
+
+        if is_plugin is None and isinstance(class_name, string_types):
+            class_name_lower = class_name.lower()
+            if "plugin" in class_name_lower:
+                is_plugin = True
+
+        for key in ["plugin_format", "plug_in_type", "plugin_type", "format"]:
+            value = self._safe_attr(device, key)
+            if isinstance(value, string_types) and value.strip():
+                plugin_format = value.strip()
+                break
+
+        for key in ["vendor", "manufacturer", "maker"]:
+            value = self._safe_attr(device, key)
+            if isinstance(value, string_types) and value.strip():
+                vendor = value.strip()
+                break
+
+        return class_name, is_plugin, plugin_format, vendor
+
+    def _serialize_device_chain_entry(self, device_index, device):
+        """Serialize one device in a track chain."""
+        name = self._safe_attr(device, "name")
+        if name is not None and not isinstance(name, string_types):
+            try:
+                name = str(name)
+            except Exception:
+                name = None
+
+        class_name, is_plugin, plugin_format, vendor = self._extract_device_plugin_metadata(device)
+        parameters = self._to_list(self._safe_attr(device, "parameters"))
+        parameter_count = len(parameters) if isinstance(parameters, list) else None
+
+        return {
+            "device_index": device_index,
+            "name": name,
+            "class_name": class_name,
+            "is_plugin": is_plugin,
+            "plugin_format": plugin_format,
+            "vendor": vendor,
+            "parameter_count": parameter_count
+        }
+
+    def _serialize_device_parameter(self, parameter_index, parameter):
+        """Serialize one device parameter."""
+        name = self._safe_attr(parameter, "name")
+        if name is not None and not isinstance(name, string_types):
+            try:
+                name = str(name)
+            except Exception:
+                name = None
+
+        value = self._json_scalar(self._safe_attr(parameter, "value"))
+        min_value = self._json_scalar(self._safe_attr(parameter, "min"))
+        max_value = self._json_scalar(self._safe_attr(parameter, "max"))
+
+        is_quantized = self._safe_attr(parameter, "is_quantized")
+        if not isinstance(is_quantized, bool):
+            is_quantized = None
+
+        is_enabled = self._safe_attr(parameter, "is_enabled")
+        if not isinstance(is_enabled, bool):
+            is_enabled = None
+
+        automation_state_raw = self._safe_attr(parameter, "automation_state")
+        automation_state = self._json_scalar(automation_state_raw)
+        if automation_state is None and automation_state_raw is not None:
+            if isinstance(automation_state_raw, string_types):
+                automation_state = automation_state_raw
+            else:
+                try:
+                    automation_state = int(automation_state_raw)
+                except Exception:
+                    automation_state = None
+
+        return {
+            "parameter_index": parameter_index,
+            "name": name,
+            "value": value,
+            "min": min_value,
+            "max": max_value,
+            "is_quantized": is_quantized,
+            "is_enabled": is_enabled,
+            "automation_state": automation_state
+        }
+
+    def _get_track_devices(self, track_index):
+        """Return the ordered device chain for a track."""
+        try:
+            song, track, error_payload = self._resolve_track_by_index(track_index)
+            if error_payload is not None:
+                return error_payload
+
+            devices_raw = self._safe_attr(track, "devices")
+            devices = self._to_list(devices_raw)
+            if not isinstance(devices, list):
+                devices = []
+
+            device_entries = []
+            for device_index, device in enumerate(devices):
+                device_entries.append(self._serialize_device_chain_entry(device_index, device))
+
+            track_name = self._safe_attr(track, "name")
+            if track_name is not None and not isinstance(track_name, string_types):
+                try:
+                    track_name = str(track_name)
+                except Exception:
+                    track_name = None
+
+            return {
+                "ok": True,
+                "track_index": int(track_index),
+                "track_name": track_name,
+                "device_count": len(device_entries),
+                "devices": device_entries
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": "get_track_devices_failed",
+                "message": str(e),
+                "track_index": track_index
+            }
+
+    def _get_device_parameters(self, track_index, device_index, offset, limit):
+        """Return paged parameters for a device on a track."""
+        try:
+            song, track, error_payload = self._resolve_track_by_index(track_index)
+            if error_payload is not None:
+                return error_payload
+
+            try:
+                device_index = int(device_index)
+            except Exception:
+                return {
+                    "ok": False,
+                    "error": "invalid_device_index",
+                    "message": "device_index must be an integer",
+                    "track_index": track_index,
+                    "device_index": device_index
+                }
+
+            try:
+                offset = int(offset)
+            except Exception:
+                return {
+                    "ok": False,
+                    "error": "invalid_offset",
+                    "message": "offset must be an integer",
+                    "track_index": track_index,
+                    "device_index": device_index
+                }
+
+            try:
+                limit = int(limit)
+            except Exception:
+                return {
+                    "ok": False,
+                    "error": "invalid_limit",
+                    "message": "limit must be an integer",
+                    "track_index": track_index,
+                    "device_index": device_index
+                }
+
+            if offset < 0:
+                return {
+                    "ok": False,
+                    "error": "invalid_offset",
+                    "message": "offset must be >= 0",
+                    "track_index": track_index,
+                    "device_index": device_index,
+                    "offset": offset
+                }
+
+            if limit <= 0:
+                return {
+                    "ok": False,
+                    "error": "invalid_limit",
+                    "message": "limit must be > 0",
+                    "track_index": track_index,
+                    "device_index": device_index,
+                    "limit": limit
+                }
+
+            devices_raw = self._safe_attr(track, "devices")
+            devices = self._to_list(devices_raw)
+            if not isinstance(devices, list):
+                devices = []
+
+            if device_index < 0 or device_index >= len(devices):
+                return {
+                    "ok": False,
+                    "error": "invalid_device_index",
+                    "message": "device_index out of range",
+                    "track_index": track_index,
+                    "device_index": device_index,
+                    "device_count": len(devices)
+                }
+
+            device = devices[device_index]
+            device_name = self._safe_attr(device, "name")
+            if device_name is not None and not isinstance(device_name, string_types):
+                try:
+                    device_name = str(device_name)
+                except Exception:
+                    device_name = None
+
+            parameters_raw = self._safe_attr(device, "parameters")
+            parameters = self._to_list(parameters_raw)
+            if not isinstance(parameters, list):
+                parameters = []
+
+            total_parameters = len(parameters)
+            start_index = min(offset, total_parameters)
+            end_index = min(total_parameters, start_index + limit)
+
+            parameter_entries = []
+            for parameter_index in range(start_index, end_index):
+                parameter_entries.append(
+                    self._serialize_device_parameter(parameter_index, parameters[parameter_index])
+                )
+
+            return {
+                "ok": True,
+                "track_index": int(track_index),
+                "device_index": int(device_index),
+                "device_name": device_name,
+                "offset": int(offset),
+                "limit": int(limit),
+                "total_parameters": total_parameters,
+                "parameters": parameter_entries
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": "get_device_parameters_failed",
+                "message": str(e),
+                "track_index": track_index,
+                "device_index": device_index
+            }
     
     def _create_midi_track(self, index):
         """Create a new MIDI track at the specified index"""
