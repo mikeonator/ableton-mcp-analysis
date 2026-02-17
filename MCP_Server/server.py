@@ -223,6 +223,7 @@ _ableton_connection = None
 
 _SOURCE_CACHE_VERSION = 2
 _SOURCE_CACHE_DIR = os.path.expanduser("~/.ableton_mcp_analysis/cache")
+_LAUNCH_CWD = os.path.abspath(os.environ.get("ABLETON_MCP_LAUNCH_CWD", os.getcwd()))
 _SUPPORTED_AUDIO_EXTENSIONS = {".wav", ".aiff", ".aif", ".mp3", ".m4a", ".flac"}
 _DEVICE_CAPABILITIES_SCHEMA_VERSION = 1
 _DEVICE_CAPABILITIES_CACHE_PATH = os.path.join(_SOURCE_CACHE_DIR, "device_capabilities.json")
@@ -383,7 +384,10 @@ def _utc_now_iso() -> str:
 
 def _normalize_source_path(file_path: str) -> str:
     """Expand and normalize a source file path."""
-    return os.path.abspath(os.path.expanduser(file_path))
+    expanded = os.path.expanduser(file_path)
+    if os.path.isabs(expanded):
+        return os.path.abspath(expanded)
+    return os.path.abspath(os.path.join(_LAUNCH_CWD, expanded))
 
 
 def _ensure_cache_dir() -> None:
