@@ -224,6 +224,25 @@ _ableton_connection = None
 _SOURCE_CACHE_VERSION = 2
 _SOURCE_CACHE_DIR = os.path.expanduser("~/.ableton_mcp_analysis/cache")
 _SUPPORTED_AUDIO_EXTENSIONS = {".wav", ".aiff", ".aif", ".mp3", ".m4a", ".flac"}
+_DEVICE_CAPABILITIES_SCHEMA_VERSION = 1
+_DEVICE_CAPABILITIES_CACHE_PATH = os.path.join(_SOURCE_CACHE_DIR, "device_capabilities.json")
+_DEVICE_INVENTORY_CACHE_SCHEMA_VERSION = 1
+_DEVICE_INVENTORY_CACHE_PATH = os.path.join(_SOURCE_CACHE_DIR, "device_inventory_cache.json")
+_DEVICE_CAPABILITY_BUCKETS = [
+    "eq",
+    "compression",
+    "reverb",
+    "delay",
+    "modulation",
+    "distortion",
+    "imaging",
+    "metering",
+    "utility",
+    "filter",
+    "pitch",
+    "dynamics",
+    "unknown"
+]
 _KNOWN_BROWSER_ROOTS = [
     "Audio Effects",
     "Plugins",
@@ -434,6 +453,365 @@ def _is_source_cache_valid(
     if cache_payload.get("stat_mtime") != stat_mtime:
         return False
     return True
+
+
+def _device_id_from_inventory_entry(name: str, path_parts: List[str]) -> str:
+    """Build stable device id from inventory name/path."""
+    key = f"{name}|{'/'.join(path_parts)}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def _normalize_inventory_devices_for_capabilities(inventory_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Convert device inventory payload into stable device descriptors."""
+    devices_payload = inventory_payload.get("devices", [])
+    if not isinstance(devices_payload, list):
+        return []
+
+    normalized: List[Dict[str, Any]] = []
+    seen_device_ids = set()
+    for item in devices_payload:
+        if not isinstance(item, dict):
+            continue
+
+        name_value = item.get("name")
+        if not isinstance(name_value, str) or not name_value.strip():
+            continue
+        name = name_value.strip()
+
+        raw_path = item.get("path")
+        path_parts: List[str] = []
+        if isinstance(raw_path, list):
+            path_parts = [part.strip() for part in raw_path if isinstance(part, str) and part.strip()]
+        elif isinstance(raw_path, str) and raw_path.strip():
+            path_parts = [part.strip() for part in raw_path.split("/") if part.strip()]
+
+        if not path_parts:
+            path_parts = [name]
+
+        root = path_parts[0] if path_parts else None
+        item_type = item.get("item_type")
+        if not isinstance(item_type, str):
+            item_type = None
+
+        device_id = _device_id_from_inventory_entry(name, path_parts)
+        if device_id in seen_device_ids:
+            continue
+        seen_device_ids.add(device_id)
+
+        normalized.append({
+            "device_id": device_id,
+            "name": name,
+            "path": path_parts,
+            "root": root,
+            "item_type": item_type
+        })
+
+    normalized.sort(key=lambda entry: (entry["name"].lower(), "/".join(entry["path"]).lower()))
+    return normalized
+
+
+def _compute_inventory_hash(devices: List[Dict[str, Any]]) -> str:
+    """Compute stable hash for normalized inventory devices."""
+    hashable_records = []
+    for item in devices:
+        if not isinstance(item, dict):
+            continue
+        hashable_records.append({
+            "device_id": item.get("device_id"),
+            "name": item.get("name"),
+            "path": item.get("path"),
+            "root": item.get("root"),
+            "item_type": item.get("item_type")
+        })
+    hashable_records.sort(key=lambda entry: str(entry.get("device_id")))
+    payload = json.dumps(hashable_records, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _default_inventory_scan_params() -> Dict[str, Any]:
+    """Default scan parameters for device inventory snapshots."""
+    return {
+        "roots": ["Audio Effects", "Plugins"],
+        "max_depth": 5,
+        "max_items_per_folder": 500,
+        "include_presets": False
+    }
+
+
+def _normalize_inventory_scan_params(scan_params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Normalize and sanitize inventory scan params."""
+    defaults = _default_inventory_scan_params()
+    if not isinstance(scan_params, dict):
+        return defaults
+
+    roots_input = scan_params.get("roots")
+    roots: List[str] = []
+    if isinstance(roots_input, list):
+        seen_roots = set()
+        for value in roots_input:
+            if not isinstance(value, str):
+                continue
+            root_name = value.strip()
+            if not root_name or root_name in seen_roots:
+                continue
+            seen_roots.add(root_name)
+            roots.append(root_name)
+    if not roots:
+        roots = list(defaults["roots"])
+
+    try:
+        max_depth = max(0, int(scan_params.get("max_depth", defaults["max_depth"])))
+    except Exception:
+        max_depth = defaults["max_depth"]
+
+    try:
+        max_items_per_folder = max(1, int(scan_params.get("max_items_per_folder", defaults["max_items_per_folder"])))
+    except Exception:
+        max_items_per_folder = defaults["max_items_per_folder"]
+
+    include_presets = bool(scan_params.get("include_presets", defaults["include_presets"]))
+
+    return {
+        "roots": roots,
+        "max_depth": max_depth,
+        "max_items_per_folder": max_items_per_folder,
+        "include_presets": include_presets
+    }
+
+
+def _scan_params_key(scan_params: Dict[str, Any]) -> str:
+    """Build stable hash key for normalized scan params."""
+    normalized = _normalize_inventory_scan_params(scan_params)
+    payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _inventory_cache_path() -> str:
+    """Return inventory snapshot cache path."""
+    return _DEVICE_INVENTORY_CACHE_PATH
+
+
+def _load_inventory_cache() -> Optional[Dict[str, Any]]:
+    """Load normalized inventory snapshot cache payload."""
+    cache_path = _inventory_cache_path()
+    if not os.path.exists(cache_path):
+        return None
+
+    try:
+        with open(cache_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("schema_version") != _DEVICE_INVENTORY_CACHE_SCHEMA_VERSION:
+        return None
+
+    inventory_hash = payload.get("inventory_hash")
+    devices_payload = payload.get("devices")
+    if not isinstance(inventory_hash, str) or not isinstance(devices_payload, list):
+        return None
+
+    normalized_scan_params = _normalize_inventory_scan_params(payload.get("scan_params"))
+    devices = _normalize_inventory_devices_for_capabilities({"devices": devices_payload})
+
+    created_at = payload.get("created_at")
+    if not isinstance(created_at, str):
+        created_at = None
+
+    return {
+        "schema_version": _DEVICE_INVENTORY_CACHE_SCHEMA_VERSION,
+        "created_at": created_at,
+        "scan_params": normalized_scan_params,
+        "scan_params_key": _scan_params_key(normalized_scan_params),
+        "inventory_hash": inventory_hash,
+        "devices": devices
+    }
+
+
+def _save_inventory_cache(payload: Dict[str, Any]) -> None:
+    """Write inventory snapshot cache payload to disk."""
+    _ensure_cache_dir()
+    with open(_inventory_cache_path(), "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+
+
+def _inventory_cache_age_sec(scan_params: Dict[str, Any]) -> Optional[float]:
+    """Return age of matching inventory snapshot cache in seconds."""
+    cache_payload = _load_inventory_cache()
+    if not isinstance(cache_payload, dict):
+        return None
+
+    if cache_payload.get("scan_params_key") != _scan_params_key(scan_params):
+        return None
+
+    created_at = cache_payload.get("created_at")
+    if not isinstance(created_at, str):
+        return None
+
+    try:
+        created_dt = datetime.fromisoformat(created_at)
+        if created_dt.tzinfo is None:
+            created_dt = created_dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        age = (now - created_dt.astimezone(timezone.utc)).total_seconds()
+        return max(0.0, float(age))
+    except Exception:
+        return None
+
+
+def _get_or_build_inventory(
+    scan_params: Dict[str, Any],
+    force_refresh: bool
+) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str], bool, List[str]]:
+    """
+    Return normalized inventory devices and hash from cache or fresh scan.
+
+    Returns (devices, inventory_hash, cache_hit, warnings).
+    """
+    normalized_scan_params = _normalize_inventory_scan_params(scan_params)
+    params_key = _scan_params_key(normalized_scan_params)
+    warnings: List[str] = []
+
+    cached_payload = _load_inventory_cache()
+    if not force_refresh and isinstance(cached_payload, dict):
+        if cached_payload.get("scan_params_key") == params_key:
+            cached_devices = cached_payload.get("devices")
+            cached_inventory_hash = cached_payload.get("inventory_hash")
+            if isinstance(cached_devices, list) and isinstance(cached_inventory_hash, str):
+                return cached_devices, cached_inventory_hash, True, warnings
+            warnings.append("inventory_cache_invalid_payload")
+        else:
+            warnings.append("inventory_cache_scan_params_mismatch")
+
+    try:
+        inventory_payload = get_device_inventory(
+            None,
+            roots=normalized_scan_params["roots"],
+            max_depth=normalized_scan_params["max_depth"],
+            max_items_per_folder=normalized_scan_params["max_items_per_folder"],
+            include_presets=normalized_scan_params["include_presets"]
+        )
+    except Exception as exc:
+        warnings.append(f"inventory_scan_failed:{str(exc)}")
+        return None, None, False, warnings
+
+    if not isinstance(inventory_payload, dict):
+        warnings.append("inventory_scan_failed:invalid_inventory_response")
+        return None, None, False, warnings
+    if inventory_payload.get("ok") is not True:
+        inventory_error = inventory_payload.get("error")
+        if isinstance(inventory_error, str):
+            warnings.append(f"inventory_scan_failed:{inventory_error}")
+        else:
+            warnings.append("inventory_scan_failed:device_inventory_failed")
+        return None, None, False, warnings
+
+    devices = _normalize_inventory_devices_for_capabilities(inventory_payload)
+    inventory_hash = _compute_inventory_hash(devices)
+    cache_payload = {
+        "schema_version": _DEVICE_INVENTORY_CACHE_SCHEMA_VERSION,
+        "created_at": _utc_now_iso(),
+        "scan_params": normalized_scan_params,
+        "scan_params_key": params_key,
+        "inventory_hash": inventory_hash,
+        "devices": devices
+    }
+    try:
+        _save_inventory_cache(cache_payload)
+    except Exception as exc:
+        warnings.append(f"inventory_cache_write_failed:{str(exc)}")
+
+    return devices, inventory_hash, False, warnings
+
+
+def _load_device_capabilities_cache() -> Dict[str, Any]:
+    """Load device capability cache from disk."""
+    default_payload = {
+        "schema_version": _DEVICE_CAPABILITIES_SCHEMA_VERSION,
+        "inventory_hash": None,
+        "updated_at": None,
+        "classifications": {}
+    }
+
+    if not os.path.exists(_DEVICE_CAPABILITIES_CACHE_PATH):
+        return default_payload
+
+    try:
+        with open(_DEVICE_CAPABILITIES_CACHE_PATH, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return default_payload
+
+    if not isinstance(payload, dict):
+        return default_payload
+
+    classifications_raw = payload.get("classifications")
+    classifications_map: Dict[str, Dict[str, Any]] = {}
+
+    if isinstance(classifications_raw, dict):
+        for device_id, entry in classifications_raw.items():
+            if not isinstance(device_id, str) or not device_id:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            classifications_map[device_id] = dict(entry)
+    elif isinstance(classifications_raw, list):
+        for entry in classifications_raw:
+            if not isinstance(entry, dict):
+                continue
+            device_id = entry.get("device_id")
+            if not isinstance(device_id, str) or not device_id:
+                continue
+            classifications_map[device_id] = dict(entry)
+
+    schema_version = payload.get("schema_version")
+    if not isinstance(schema_version, int):
+        schema_version = _DEVICE_CAPABILITIES_SCHEMA_VERSION
+
+    inventory_hash = payload.get("inventory_hash")
+    if not isinstance(inventory_hash, str):
+        inventory_hash = None
+
+    updated_at = payload.get("updated_at")
+    if not isinstance(updated_at, str):
+        updated_at = None
+
+    return {
+        "schema_version": schema_version,
+        "inventory_hash": inventory_hash,
+        "updated_at": updated_at,
+        "classifications": classifications_map
+    }
+
+
+def _write_device_capabilities_cache(payload: Dict[str, Any]) -> None:
+    """Persist device capability cache to disk."""
+    _ensure_cache_dir()
+    with open(_DEVICE_CAPABILITIES_CACHE_PATH, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+
+
+def _get_current_inventory_devices_and_hash(ctx: Context) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str], Optional[str]]:
+    """
+    Return current inventory devices with stable hash.
+
+    Returns (devices, inventory_hash, error_message).
+    """
+    _ = ctx
+    devices, inventory_hash, _, warnings = _get_or_build_inventory(
+        scan_params=_default_inventory_scan_params(),
+        force_refresh=False
+    )
+    if devices is None or inventory_hash is None:
+        if warnings:
+            last_warning = warnings[-1]
+            if isinstance(last_warning, str) and ":" in last_warning:
+                return None, None, last_warning.split(":", 1)[1]
+            return None, None, last_warning
+        return None, None, "inventory_unavailable"
+    return devices, inventory_hash, None
 
 
 def _decode_audio_samples(file_path: str) -> Tuple[Any, int, int, str]:
@@ -1953,6 +2331,236 @@ def get_device_inventory(
             "error": "device_inventory_failed",
             "message": str(e)
         }
+
+
+@mcp.tool()
+def get_capability_map_status(ctx: Context) -> Dict[str, Any]:
+    """Return classification cache status for current inventory."""
+    cache_payload = _load_device_capabilities_cache()
+    classifications = cache_payload.get("classifications", {})
+    if not isinstance(classifications, dict):
+        classifications = {}
+
+    scan_params = _default_inventory_scan_params()
+    devices, inventory_hash, inventory_cache_hit, inventory_warnings = _get_or_build_inventory(
+        scan_params=scan_params,
+        force_refresh=False
+    )
+    cache_age_sec = _inventory_cache_age_sec(scan_params)
+    if devices is None or inventory_hash is None:
+        inventory_message = "Failed to resolve current inventory"
+        if inventory_warnings:
+            inventory_message = inventory_warnings[-1]
+            if ":" in inventory_message:
+                inventory_message = inventory_message.split(":", 1)[1]
+
+        return {
+            "ok": False,
+            "error": "inventory_unavailable",
+            "message": inventory_message,
+            "inventory_hash": None,
+            "classified_count": len(classifications),
+            "unclassified_count": 0,
+            "cache_hit": bool(inventory_cache_hit),
+            "cache_age_sec": cache_age_sec,
+            "scan_params": scan_params,
+            "cache_path": _DEVICE_CAPABILITIES_CACHE_PATH,
+            "schema_version": _DEVICE_CAPABILITIES_SCHEMA_VERSION
+        }
+
+    classified_count = 0
+    for device in devices:
+        device_id = device.get("device_id")
+        if isinstance(device_id, str) and device_id in classifications:
+            classified_count += 1
+
+    return {
+        "ok": True,
+        "inventory_hash": inventory_hash,
+        "classified_count": classified_count,
+        "unclassified_count": max(0, len(devices) - classified_count),
+        "cache_hit": bool(inventory_cache_hit),
+        "cache_age_sec": cache_age_sec,
+        "scan_params": scan_params,
+        "cache_path": _DEVICE_CAPABILITIES_CACHE_PATH,
+        "schema_version": _DEVICE_CAPABILITIES_SCHEMA_VERSION
+    }
+    if inventory_warnings:
+        result["warnings"] = inventory_warnings
+    return result
+
+
+@mcp.tool()
+def get_devices_for_classification(
+    ctx: Context,
+    max_items: int = 200,
+    force_refresh: bool = False
+) -> Dict[str, Any]:
+    """Return inventory devices that are missing classifications."""
+    try:
+        limit = max(1, int(max_items))
+    except Exception:
+        limit = 200
+
+    scan_params = _default_inventory_scan_params()
+    devices, inventory_hash, inventory_cache_hit, inventory_warnings = _get_or_build_inventory(
+        scan_params=scan_params,
+        force_refresh=bool(force_refresh)
+    )
+    if devices is None or inventory_hash is None:
+        inventory_message = "Failed to resolve current inventory"
+        if inventory_warnings:
+            inventory_message = inventory_warnings[-1]
+            if ":" in inventory_message:
+                inventory_message = inventory_message.split(":", 1)[1]
+
+        return {
+            "ok": False,
+            "error": "inventory_unavailable",
+            "message": inventory_message,
+            "inventory_hash": None,
+            "devices": [],
+            "truncated": False,
+            "cache_hit": bool(inventory_cache_hit)
+        }
+
+    cache_payload = _load_device_capabilities_cache()
+    classifications = cache_payload.get("classifications", {})
+    if not isinstance(classifications, dict):
+        classifications = {}
+
+    unclassified_devices = []
+    for device in devices:
+        device_id = device.get("device_id")
+        if isinstance(device_id, str) and device_id in classifications:
+            continue
+        unclassified_devices.append(device)
+
+    truncated = len(unclassified_devices) > limit
+    result = {
+        "ok": True,
+        "inventory_hash": inventory_hash,
+        "devices": unclassified_devices[:limit],
+        "truncated": truncated,
+        "cache_hit": bool(inventory_cache_hit)
+    }
+    if inventory_warnings:
+        result["warnings"] = inventory_warnings
+    return result
+
+
+@mcp.tool()
+def save_device_classifications(
+    ctx: Context,
+    inventory_hash: str,
+    classifications: List[Dict[str, Any]],
+    overwrite: bool = False
+) -> Dict[str, Any]:
+    """Persist device capability classifications from an external LLM."""
+    if not isinstance(classifications, list):
+        return {
+            "ok": False,
+            "error": "invalid_classifications",
+            "message": "classifications must be a list",
+            "saved_count": 0,
+            "skipped_count": 0,
+            "errors": [{"index": None, "error": "classifications_not_list"}],
+            "cache_path": _DEVICE_CAPABILITIES_CACHE_PATH
+        }
+
+    allowed_buckets = set(_DEVICE_CAPABILITY_BUCKETS)
+    cache_payload = _load_device_capabilities_cache()
+    existing = cache_payload.get("classifications", {})
+    if not isinstance(existing, dict):
+        existing = {}
+
+    saved_count = 0
+    skipped_count = 0
+    errors: List[Dict[str, Any]] = []
+
+    for idx, entry in enumerate(classifications):
+        if not isinstance(entry, dict):
+            errors.append({"index": idx, "error": "invalid_entry_type"})
+            continue
+
+        device_id = entry.get("device_id")
+        if not isinstance(device_id, str) or not device_id.strip():
+            errors.append({"index": idx, "error": "invalid_device_id"})
+            continue
+        device_id = device_id.strip()
+
+        bucket = entry.get("bucket")
+        if not isinstance(bucket, str) or bucket not in allowed_buckets:
+            errors.append({
+                "index": idx,
+                "device_id": device_id,
+                "error": "invalid_bucket",
+                "allowed_buckets": _DEVICE_CAPABILITY_BUCKETS
+            })
+            continue
+
+        confidence_raw = entry.get("confidence")
+        try:
+            confidence = float(confidence_raw)
+        except Exception:
+            errors.append({"index": idx, "device_id": device_id, "error": "invalid_confidence"})
+            continue
+
+        if confidence < 0.0 or confidence > 1.0:
+            errors.append({"index": idx, "device_id": device_id, "error": "confidence_out_of_range"})
+            continue
+
+        if (not overwrite) and (device_id in existing):
+            skipped_count += 1
+            continue
+
+        notes_value = entry.get("notes")
+        notes = None
+        if isinstance(notes_value, str) and notes_value.strip():
+            notes = notes_value.strip()
+
+        stored = {
+            "device_id": device_id,
+            "bucket": bucket,
+            "confidence": round(confidence, 6),
+            "updated_at": _utc_now_iso()
+        }
+        if notes is not None:
+            stored["notes"] = notes
+
+        existing[device_id] = stored
+        saved_count += 1
+
+    _, current_inventory_hash, inventory_error = _get_current_inventory_devices_and_hash(ctx)
+    warnings: List[str] = []
+    if inventory_error is not None:
+        warnings.append(f"current_inventory_hash_unavailable:{inventory_error}")
+    elif isinstance(inventory_hash, str) and inventory_hash and current_inventory_hash != inventory_hash:
+        warnings.append("inventory_hash_mismatch")
+
+    next_inventory_hash: Optional[str] = current_inventory_hash
+    if next_inventory_hash is None and isinstance(inventory_hash, str) and inventory_hash:
+        next_inventory_hash = inventory_hash
+
+    output_payload = {
+        "schema_version": _DEVICE_CAPABILITIES_SCHEMA_VERSION,
+        "inventory_hash": next_inventory_hash,
+        "updated_at": _utc_now_iso(),
+        "classifications": existing
+    }
+    _write_device_capabilities_cache(output_payload)
+
+    return {
+        "ok": True,
+        "saved_count": saved_count,
+        "skipped_count": skipped_count,
+        "errors": errors,
+        "cache_path": _DEVICE_CAPABILITIES_CACHE_PATH,
+        "warnings": warnings,
+        "classified_total": len(existing),
+        "current_inventory_hash": current_inventory_hash,
+        "submitted_inventory_hash": inventory_hash
+    }
 
 
 @mcp.tool()
