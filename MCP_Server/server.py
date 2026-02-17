@@ -228,6 +228,8 @@ _DEVICE_CAPABILITIES_SCHEMA_VERSION = 1
 _DEVICE_CAPABILITIES_CACHE_PATH = os.path.join(_SOURCE_CACHE_DIR, "device_capabilities.json")
 _DEVICE_INVENTORY_CACHE_SCHEMA_VERSION = 1
 _DEVICE_INVENTORY_CACHE_PATH = os.path.join(_SOURCE_CACHE_DIR, "device_inventory_cache.json")
+_PROJECT_SNAPSHOT_SCHEMA_VERSION = 1
+_PROJECT_SNAPSHOT_DIR = os.path.join(_SOURCE_CACHE_DIR, "project_snapshots")
 _DEVICE_CAPABILITY_BUCKETS = [
     "eq",
     "compression",
@@ -724,6 +726,184 @@ def _get_or_build_inventory(
         warnings.append(f"inventory_cache_write_failed:{str(exc)}")
 
     return devices, inventory_hash, False, warnings
+
+
+def _ensure_project_snapshot_dir() -> None:
+    """Ensure project snapshot cache directory exists."""
+    os.makedirs(_PROJECT_SNAPSHOT_DIR, exist_ok=True)
+
+
+def _project_device_key(track_index: int, device_index: int) -> str:
+    """Build stable per-track device key."""
+    return f"{int(track_index)}:{int(device_index)}"
+
+
+def _stable_snapshot_device_key(
+    track_index: int,
+    class_name: Any,
+    device_name: Any,
+    occurrence_index: int
+) -> str:
+    """Build stable per-track snapshot device key resilient to index shifts."""
+    class_name_value = class_name if isinstance(class_name, str) and class_name else "unknown_class"
+    device_name_value = device_name if isinstance(device_name, str) and device_name else "unknown_device"
+    return f"{int(track_index)}|{class_name_value}|{device_name_value}|{int(occurrence_index)}"
+
+
+def _resolve_snapshot_device_key(
+    device_payload: Dict[str, Any],
+    track_index: int,
+    occurrence_index: int
+) -> str:
+    """Resolve stable device key from snapshot payload, with legacy fallback."""
+    existing = device_payload.get("device_key")
+    if isinstance(existing, str) and existing.strip():
+        return existing.strip()
+    return _stable_snapshot_device_key(
+        track_index=track_index,
+        class_name=device_payload.get("class_name"),
+        device_name=device_payload.get("name"),
+        occurrence_index=occurrence_index
+    )
+
+
+def _safe_json_file_load(file_path: str) -> Optional[Dict[str, Any]]:
+    """Load a JSON object file safely."""
+    if not os.path.exists(file_path):
+        return None
+    try:
+        with open(file_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        return None
+    return None
+
+
+def _safe_json_file_write(file_path: str, payload: Dict[str, Any]) -> None:
+    """Write JSON object file safely."""
+    parent = os.path.dirname(file_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(file_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+
+
+def _project_snapshot_timestamp_token() -> str:
+    """Return UTC timestamp token for snapshot ids."""
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _resolve_project_snapshot_file(snapshot_id: str) -> Optional[str]:
+    """Resolve snapshot id or path to snapshot json file."""
+    if not isinstance(snapshot_id, str):
+        return None
+
+    candidate = snapshot_id.strip()
+    if not candidate:
+        return None
+
+    if os.path.isabs(candidate):
+        if os.path.exists(candidate) and candidate.endswith(".json"):
+            return candidate
+        return None
+
+    if candidate.endswith(".json"):
+        direct = os.path.join(_PROJECT_SNAPSHOT_DIR, candidate)
+    else:
+        direct = os.path.join(_PROJECT_SNAPSHOT_DIR, f"{candidate}.json")
+
+    if os.path.exists(direct):
+        return direct
+
+    prefix = candidate if not candidate.endswith(".json") else candidate[:-5]
+    try:
+        matches = []
+        for name in os.listdir(_PROJECT_SNAPSHOT_DIR):
+            if not name.endswith(".json"):
+                continue
+            if name.endswith(".params.json"):
+                continue
+            if name.startswith(prefix):
+                matches.append(os.path.join(_PROJECT_SNAPSHOT_DIR, name))
+        if len(matches) == 1:
+            return matches[0]
+    except Exception:
+        return None
+
+    return None
+
+
+def _build_snapshot_project_hash(session_payload: Dict[str, Any], tracks_payload: List[Dict[str, Any]]) -> str:
+    """Compute stable project hash from compact snapshot payload."""
+    hash_payload = {
+        "session": {
+            "tempo": session_payload.get("tempo"),
+            "signature_numerator": session_payload.get("signature_numerator"),
+            "signature_denominator": session_payload.get("signature_denominator"),
+            "track_count": session_payload.get("track_count")
+        },
+        "tracks": []
+    }
+
+    for track in tracks_payload:
+        if not isinstance(track, dict):
+            continue
+        hash_payload["tracks"].append({
+            "track_index": track.get("track_index"),
+            "track_name": track.get("track_name"),
+            "mixer": track.get("mixer"),
+            "devices": track.get("devices")
+        })
+
+    hash_payload["tracks"].sort(key=lambda item: int(item.get("track_index", -1)))
+    serialized = json.dumps(hash_payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _resolve_snapshot_sidecar_file(snapshot_payload: Dict[str, Any], snapshot_file_path: str) -> Optional[str]:
+    """Resolve a parameter sidecar path for a saved project snapshot."""
+    sidecar_hint = snapshot_payload.get("parameter_sidecar_file")
+    if isinstance(sidecar_hint, str) and sidecar_hint.strip():
+        sidecar_hint = sidecar_hint.strip()
+        if os.path.isabs(sidecar_hint):
+            if os.path.exists(sidecar_hint):
+                return sidecar_hint
+        else:
+            candidate = os.path.join(os.path.dirname(snapshot_file_path), sidecar_hint)
+            if os.path.exists(candidate):
+                return candidate
+
+    if snapshot_file_path.endswith(".json"):
+        fallback = snapshot_file_path[:-5] + ".params.json"
+    else:
+        fallback = snapshot_file_path + ".params.json"
+    if os.path.exists(fallback):
+        return fallback
+
+    return None
+
+
+def _snapshot_parameter_index_map(parameter_rows: Any) -> Dict[int, Dict[str, Any]]:
+    """Build parameter index map from compact parameter rows."""
+    mapped: Dict[int, Dict[str, Any]] = {}
+    if not isinstance(parameter_rows, list):
+        return mapped
+    for row in parameter_rows:
+        if not isinstance(row, dict):
+            continue
+        parameter_index = row.get("parameter_index")
+        try:
+            parameter_index = int(parameter_index)
+        except Exception:
+            continue
+        mapped[parameter_index] = {
+            "parameter_index": parameter_index,
+            "name": row.get("name"),
+            "value": row.get("value")
+        }
+    return mapped
 
 
 def _load_device_capabilities_cache() -> Dict[str, Any]:
@@ -2042,6 +2222,1020 @@ def get_detail_clip_source_path(ctx: Context) -> Dict[str, Any]:
             "error": "get_detail_clip_source_path_failed",
             "message": str(e)
         }
+
+
+@mcp.tool()
+def get_track_device_chain(ctx: Context, track_index: int) -> Dict[str, Any]:
+    """
+    Get ordered device chain metadata for a track.
+
+    Parameters:
+    - track_index: 0-based track index
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_track_devices", {"track_index": track_index})
+        if isinstance(result, dict):
+            if "ok" not in result:
+                result = dict(result)
+                result["ok"] = True
+            return result
+
+        return {
+            "ok": False,
+            "error": "invalid_response",
+            "message": "Backend returned a non-dict response",
+            "track_index": track_index,
+            "debug": {
+                "backend_command": "get_track_devices",
+                "backend_result_type": str(type(result))
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error getting track device chain: {str(e)}")
+        return {
+            "ok": False,
+            "error": "get_track_device_chain_failed",
+            "message": str(e),
+            "track_index": track_index
+        }
+
+
+@mcp.tool()
+def get_device_parameters(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    offset: int = 0,
+    limit: int = 64
+) -> Dict[str, Any]:
+    """
+    Get paged device parameters for a track device.
+
+    Parameters:
+    - track_index: 0-based track index
+    - device_index: 0-based device index on the track
+    - offset: parameter offset
+    - limit: page size
+    """
+    try:
+        offset_value = int(offset)
+        limit_value = int(limit)
+    except Exception:
+        return {
+            "ok": False,
+            "error": "invalid_paging",
+            "message": "offset and limit must be integers",
+            "track_index": track_index,
+            "device_index": device_index,
+            "offset": offset,
+            "limit": limit
+        }
+
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_device_parameters", {
+            "track_index": track_index,
+            "device_index": device_index,
+            "offset": offset_value,
+            "limit": limit_value
+        })
+        if isinstance(result, dict):
+            if "ok" not in result:
+                result = dict(result)
+                result["ok"] = True
+            return result
+
+        return {
+            "ok": False,
+            "error": "invalid_response",
+            "message": "Backend returned a non-dict response",
+            "track_index": track_index,
+            "device_index": device_index,
+            "offset": offset_value,
+            "limit": limit_value,
+            "debug": {
+                "backend_command": "get_device_parameters",
+                "backend_result_type": str(type(result))
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error getting device parameters: {str(e)}")
+        return {
+            "ok": False,
+            "error": "get_device_parameters_failed",
+            "message": str(e),
+            "track_index": track_index,
+            "device_index": device_index,
+            "offset": offset_value,
+            "limit": limit_value
+        }
+
+
+@mcp.tool()
+def snapshot_device_parameters(ctx: Context, track_index: int, device_index: int) -> Dict[str, Any]:
+    """
+    Build a deterministic all-parameter snapshot hash for a track device.
+
+    Parameters:
+    - track_index: 0-based track index
+    - device_index: 0-based device index on the track
+    """
+    page_size = 256
+
+    def _snapshot_rows(parameter_payload: Any) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        if not isinstance(parameter_payload, list):
+            return rows
+
+        for parameter in parameter_payload:
+            if not isinstance(parameter, dict):
+                continue
+            parameter_index = parameter.get("parameter_index")
+            try:
+                parameter_index = int(parameter_index)
+            except Exception:
+                continue
+
+            rows.append({
+                "parameter_index": parameter_index,
+                "name": parameter.get("name"),
+                "value": parameter.get("value")
+            })
+        return rows
+
+    try:
+        ableton = get_ableton_connection()
+        first_page = ableton.send_command("get_device_parameters", {
+            "track_index": track_index,
+            "device_index": device_index,
+            "offset": 0,
+            "limit": page_size
+        })
+        if not isinstance(first_page, dict):
+            return {
+                "ok": False,
+                "error": "invalid_response",
+                "message": "Backend returned a non-dict response",
+                "track_index": track_index,
+                "device_index": device_index,
+                "debug": {
+                    "backend_command": "get_device_parameters",
+                    "backend_result_type": str(type(first_page))
+                }
+            }
+        if first_page.get("ok") is False:
+            return first_page
+
+        total_parameters_raw = first_page.get("total_parameters")
+        try:
+            total_parameters = int(total_parameters_raw)
+            if total_parameters < 0:
+                total_parameters = 0
+        except Exception:
+            total_parameters = len(_snapshot_rows(first_page.get("parameters", [])))
+
+        device_name = first_page.get("device_name")
+        snapshot_by_index: Dict[int, Dict[str, Any]] = {}
+        first_rows = _snapshot_rows(first_page.get("parameters", []))
+        for row in first_rows:
+            snapshot_by_index[row["parameter_index"]] = row
+
+        next_offset = page_size
+        while next_offset < total_parameters:
+            page_result = ableton.send_command("get_device_parameters", {
+                "track_index": track_index,
+                "device_index": device_index,
+                "offset": next_offset,
+                "limit": page_size
+            })
+            if not isinstance(page_result, dict):
+                return {
+                    "ok": False,
+                    "error": "invalid_response",
+                    "message": "Backend returned a non-dict response during snapshot pagination",
+                    "track_index": track_index,
+                    "device_index": device_index,
+                    "offset": next_offset
+                }
+            if page_result.get("ok") is False:
+                return page_result
+
+            rows = _snapshot_rows(page_result.get("parameters", []))
+            if not rows:
+                break
+
+            for row in rows:
+                snapshot_by_index[row["parameter_index"]] = row
+
+            next_offset += page_size
+
+        snapshot = sorted(snapshot_by_index.values(), key=lambda item: item["parameter_index"])
+        if len(snapshot) < total_parameters:
+            return {
+                "ok": False,
+                "error": "incomplete_snapshot",
+                "message": (
+                    f"Expected {total_parameters} parameters but only captured {len(snapshot)}"
+                ),
+                "track_index": track_index,
+                "device_index": device_index,
+                "device_name": device_name,
+                "parameter_count": len(snapshot)
+            }
+
+        snapshot_payload = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+        snapshot_hash = "sha256:" + hashlib.sha256(snapshot_payload.encode("utf-8")).hexdigest()
+
+        return {
+            "ok": True,
+            "track_index": track_index,
+            "device_index": device_index,
+            "device_name": device_name,
+            "parameter_count": len(snapshot),
+            "snapshot_hash": snapshot_hash,
+            "snapshot": snapshot
+        }
+    except Exception as e:
+        logger.error(f"Error snapshotting device parameters: {str(e)}")
+        return {
+            "ok": False,
+            "error": "snapshot_device_parameters_failed",
+            "message": str(e),
+            "track_index": track_index,
+            "device_index": device_index
+        }
+
+
+@mcp.tool()
+def snapshot_project_state(ctx: Context, include_device_hashes: bool = True) -> Dict[str, Any]:
+    """
+    Capture a compact project state snapshot and persist it to cache.
+
+    Parameters:
+    - include_device_hashes: include per-device parameter snapshot hashes
+    """
+    warnings: List[str] = []
+
+    try:
+        ableton = get_ableton_connection()
+        session_payload = ableton.send_command("get_session_info")
+        if not isinstance(session_payload, dict):
+            return {
+                "ok": False,
+                "error": "invalid_session_info",
+                "message": "Backend returned a non-dict session response"
+            }
+
+        track_count = session_payload.get("track_count")
+        if not isinstance(track_count, int) or track_count < 0:
+            return {
+                "ok": False,
+                "error": "invalid_session_info",
+                "message": "track_count missing or invalid"
+            }
+
+        session_compact = {
+            "tempo": session_payload.get("tempo"),
+            "signature_numerator": session_payload.get("signature_numerator"),
+            "signature_denominator": session_payload.get("signature_denominator"),
+            "track_count": track_count,
+            "return_track_count": session_payload.get("return_track_count")
+        }
+
+        tracks_payload: List[Dict[str, Any]] = []
+        sidecar_devices: Dict[str, Dict[str, Any]] = {}
+        track_with_devices_count = 0
+        device_count = 0
+        plugin_device_count = 0
+        devices_with_hash_count = 0
+
+        include_hashes = bool(include_device_hashes)
+        for track_index in range(track_count):
+            track_info = ableton.send_command("get_track_info", {"track_index": track_index})
+            if not isinstance(track_info, dict):
+                track_info = {}
+                warnings.append(f"track_info_invalid:{track_index}")
+
+            chain_payload = ableton.send_command("get_track_devices", {"track_index": track_index})
+            if not isinstance(chain_payload, dict):
+                chain_payload = {"ok": False}
+                warnings.append(f"track_device_chain_invalid:{track_index}")
+
+            track_name = None
+            if isinstance(chain_payload.get("track_name"), str):
+                track_name = chain_payload.get("track_name")
+            elif isinstance(track_info.get("name"), str):
+                track_name = track_info.get("name")
+
+            track_row = {
+                "track_index": track_index,
+                "track_name": track_name,
+                "mixer": {
+                    "volume": track_info.get("volume"),
+                    "panning": track_info.get("panning"),
+                    "mute": track_info.get("mute"),
+                    "solo": track_info.get("solo"),
+                    "arm": track_info.get("arm")
+                },
+                "device_count": 0,
+                "devices": []
+            }
+
+            devices_payload = chain_payload.get("devices", [])
+            if not isinstance(devices_payload, list):
+                devices_payload = []
+
+            if devices_payload:
+                track_with_devices_count += 1
+
+            device_occurrence_counts: Dict[Tuple[str, str], int] = {}
+            for device in devices_payload:
+                if not isinstance(device, dict):
+                    continue
+
+                device_index = device.get("device_index")
+                if not isinstance(device_index, int):
+                    continue
+
+                is_plugin = device.get("is_plugin")
+                class_name = device.get("class_name")
+                device_name = device.get("name") if isinstance(device.get("name"), str) else None
+                class_name_key = class_name if isinstance(class_name, str) and class_name else "unknown_class"
+                device_name_key = device_name if isinstance(device_name, str) and device_name else "unknown_device"
+                occurrence_tuple = (class_name_key, device_name_key)
+                occurrence_index = device_occurrence_counts.get(occurrence_tuple, 0)
+                device_occurrence_counts[occurrence_tuple] = occurrence_index + 1
+                device_key = _stable_snapshot_device_key(
+                    track_index=track_index,
+                    class_name=class_name_key,
+                    device_name=device_name_key,
+                    occurrence_index=occurrence_index
+                )
+
+                if is_plugin is True or class_name == "PluginDevice":
+                    plugin_device_count += 1
+                device_count += 1
+
+                device_row = {
+                    "device_key": device_key,
+                    "device_index": device_index,
+                    "name": device_name,
+                    "device_name": device_name,
+                    "class_name": class_name,
+                    "is_plugin": is_plugin,
+                    "plugin_format": device.get("plugin_format"),
+                    "vendor": device.get("vendor"),
+                    "parameter_count": device.get("parameter_count"),
+                    "snapshot_hash": None
+                }
+
+                if include_hashes:
+                    snapshot_payload = snapshot_device_parameters(ctx, track_index, device_index)
+                    if isinstance(snapshot_payload, dict) and snapshot_payload.get("ok"):
+                        snapshot_hash = snapshot_payload.get("snapshot_hash")
+                        if isinstance(snapshot_hash, str):
+                            device_row["snapshot_hash"] = snapshot_hash
+                            devices_with_hash_count += 1
+
+                        snapshot_rows = snapshot_payload.get("snapshot", [])
+                        sidecar_devices[device_key] = {
+                            "device_key": device_key,
+                            "legacy_device_key": _project_device_key(track_index, device_index),
+                            "track_index": track_index,
+                            "track_name": track_name,
+                            "device_index": device_index,
+                            "device_name": device_name,
+                            "class_name": class_name,
+                            "parameters": sorted(
+                                _snapshot_parameter_index_map(snapshot_rows).values(),
+                                key=lambda item: item["parameter_index"]
+                            )
+                        }
+                    else:
+                        snapshot_error = None
+                        if isinstance(snapshot_payload, dict):
+                            snapshot_error = snapshot_payload.get("error")
+                        warnings.append(
+                            f"device_snapshot_failed:{track_index}:{device_index}:{snapshot_error or 'unknown'}"
+                        )
+
+                track_row["devices"].append(device_row)
+
+            track_row["device_count"] = len(track_row["devices"])
+            tracks_payload.append(track_row)
+
+        project_hash = _build_snapshot_project_hash(session_compact, tracks_payload)
+        created_at = _utc_now_iso()
+        timestamp_token = _project_snapshot_timestamp_token()
+        snapshot_base = f"{timestamp_token}_{project_hash}"
+        snapshot_id = snapshot_base
+
+        _ensure_project_snapshot_dir()
+        snapshot_file_path = os.path.join(_PROJECT_SNAPSHOT_DIR, f"{snapshot_id}.json")
+        suffix = 2
+        while os.path.exists(snapshot_file_path):
+            snapshot_id = f"{snapshot_base}_{suffix}"
+            snapshot_file_path = os.path.join(_PROJECT_SNAPSHOT_DIR, f"{snapshot_id}.json")
+            suffix += 1
+
+        snapshot_payload = {
+            "schema_version": _PROJECT_SNAPSHOT_SCHEMA_VERSION,
+            "snapshot_id": snapshot_id,
+            "created_at": created_at,
+            "project_hash": project_hash,
+            "include_device_hashes": include_hashes,
+            "session": session_compact,
+            "track_count": track_count,
+            "tracks": tracks_payload
+        }
+
+        if include_hashes:
+            sidecar_file_name = f"{snapshot_id}.params.json"
+            sidecar_file_path = os.path.join(_PROJECT_SNAPSHOT_DIR, sidecar_file_name)
+            sidecar_payload = {
+                "schema_version": _PROJECT_SNAPSHOT_SCHEMA_VERSION,
+                "snapshot_id": snapshot_id,
+                "created_at": created_at,
+                "devices": sidecar_devices
+            }
+            _safe_json_file_write(sidecar_file_path, sidecar_payload)
+            snapshot_payload["parameter_sidecar_file"] = sidecar_file_name
+
+        _safe_json_file_write(snapshot_file_path, snapshot_payload)
+
+        result = {
+            "ok": True,
+            "snapshot_id": snapshot_id,
+            "file_path": snapshot_file_path,
+            "project_hash": project_hash,
+            "include_device_hashes": include_hashes,
+            "summary": {
+                "track_count": track_count,
+                "tracks_with_devices": track_with_devices_count,
+                "device_count": device_count,
+                "plugin_device_count": plugin_device_count,
+                "devices_with_hashes": devices_with_hash_count
+            }
+        }
+        if warnings:
+            result["warnings"] = warnings
+        return result
+    except Exception as e:
+        logger.error(f"Error snapshotting project state: {str(e)}")
+        return {
+            "ok": False,
+            "error": "snapshot_project_state_failed",
+            "message": str(e)
+        }
+
+
+@mcp.tool()
+def diff_project_state(
+    ctx: Context,
+    before_snapshot_id: str,
+    after_snapshot_id: str,
+    include_parameter_diffs: bool = False
+) -> Dict[str, Any]:
+    """
+    Diff two saved project state snapshots.
+
+    Parameters:
+    - before_snapshot_id: snapshot id (or file name/path) for the baseline
+    - after_snapshot_id: snapshot id (or file name/path) for the comparison snapshot
+    - include_parameter_diffs: include compact parameter deltas for devices with changed hashes
+    """
+    _ = ctx
+
+    def _track_map(payload: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
+        mapped: Dict[int, Dict[str, Any]] = {}
+        tracks = payload.get("tracks", [])
+        if not isinstance(tracks, list):
+            return mapped
+        for track in tracks:
+            if not isinstance(track, dict):
+                continue
+            track_index = track.get("track_index")
+            try:
+                track_index = int(track_index)
+            except Exception:
+                continue
+            mapped[track_index] = track
+        return mapped
+
+    def _device_signature(device: Dict[str, Any]) -> str:
+        return f"{device.get('name')}|{device.get('class_name')}"
+
+    def _multiset_counts(values: List[str]) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for value in values:
+            counts[value] = counts.get(value, 0) + 1
+        return counts
+
+    def _keyed_devices(track_index: int, devices: List[Any]) -> List[Dict[str, Any]]:
+        keyed: List[Dict[str, Any]] = []
+        occurrence_counts: Dict[Tuple[str, str], int] = {}
+        for device in devices:
+            if not isinstance(device, dict):
+                continue
+
+            class_name = device.get("class_name")
+            device_name = device.get("device_name")
+            if not isinstance(device_name, str):
+                device_name = device.get("name")
+
+            class_name_key = class_name if isinstance(class_name, str) and class_name else "unknown_class"
+            device_name_key = device_name if isinstance(device_name, str) and device_name else "unknown_device"
+            occurrence_tuple = (class_name_key, device_name_key)
+            occurrence_index = occurrence_counts.get(occurrence_tuple, 0)
+            occurrence_counts[occurrence_tuple] = occurrence_index + 1
+
+            resolved_key = _resolve_snapshot_device_key(device, track_index, occurrence_index)
+            row = dict(device)
+            row["_resolved_device_key"] = resolved_key
+            row["_resolved_device_name"] = device_name
+            keyed.append(row)
+        return keyed
+
+    def _sidecar_device_payload(
+        sidecar_devices: Dict[str, Any],
+        device_key: Any,
+        track_index: Any,
+        device_index: Any
+    ) -> Dict[str, Any]:
+        if not isinstance(sidecar_devices, dict):
+            return {}
+
+        if isinstance(device_key, str) and device_key:
+            payload = sidecar_devices.get(device_key)
+            if isinstance(payload, dict):
+                return payload
+
+        if isinstance(track_index, int) and isinstance(device_index, int):
+            legacy_key = _project_device_key(track_index, device_index)
+            payload = sidecar_devices.get(legacy_key)
+            if isinstance(payload, dict):
+                return payload
+        return {}
+
+    warnings: List[str] = []
+
+    before_path = _resolve_project_snapshot_file(before_snapshot_id)
+    if before_path is None:
+        return {
+            "ok": False,
+            "error": "before_snapshot_not_found",
+            "message": f"Could not resolve snapshot '{before_snapshot_id}'"
+        }
+
+    after_path = _resolve_project_snapshot_file(after_snapshot_id)
+    if after_path is None:
+        return {
+            "ok": False,
+            "error": "after_snapshot_not_found",
+            "message": f"Could not resolve snapshot '{after_snapshot_id}'"
+        }
+
+    before_payload = _safe_json_file_load(before_path)
+    if not isinstance(before_payload, dict):
+        return {
+            "ok": False,
+            "error": "before_snapshot_invalid",
+            "message": f"Could not read snapshot file '{before_path}'"
+        }
+
+    after_payload = _safe_json_file_load(after_path)
+    if not isinstance(after_payload, dict):
+        return {
+            "ok": False,
+            "error": "after_snapshot_invalid",
+            "message": f"Could not read snapshot file '{after_path}'"
+        }
+
+    before_tracks = _track_map(before_payload)
+    after_tracks = _track_map(after_payload)
+
+    before_track_indices = set(before_tracks.keys())
+    after_track_indices = set(after_tracks.keys())
+
+    added_tracks = []
+    for track_index in sorted(after_track_indices - before_track_indices):
+        track = after_tracks.get(track_index, {})
+        added_tracks.append({
+            "track_index": track_index,
+            "track_name": track.get("track_name")
+        })
+
+    removed_tracks = []
+    for track_index in sorted(before_track_indices - after_track_indices):
+        track = before_tracks.get(track_index, {})
+        removed_tracks.append({
+            "track_index": track_index,
+            "track_name": track.get("track_name")
+        })
+
+    session_changes = []
+    before_session = before_payload.get("session", {})
+    after_session = after_payload.get("session", {})
+    for key in ["tempo", "signature_numerator", "signature_denominator"]:
+        before_value = before_session.get(key) if isinstance(before_session, dict) else None
+        after_value = after_session.get(key) if isinstance(after_session, dict) else None
+        if before_value != after_value:
+            session_changes.append({
+                "field": key,
+                "before": before_value,
+                "after": after_value
+            })
+
+    mixer_changes = []
+    device_chain_changes = []
+    changed_device_hashes = []
+
+    shared_tracks = sorted(before_track_indices & after_track_indices)
+    for track_index in shared_tracks:
+        before_track = before_tracks.get(track_index, {})
+        after_track = after_tracks.get(track_index, {})
+
+        before_mixer = before_track.get("mixer", {}) if isinstance(before_track.get("mixer"), dict) else {}
+        after_mixer = after_track.get("mixer", {}) if isinstance(after_track.get("mixer"), dict) else {}
+
+        mixer_delta = {}
+        for field in ["volume", "panning", "mute", "solo", "arm"]:
+            before_value = before_mixer.get(field)
+            after_value = after_mixer.get(field)
+            if before_value != after_value:
+                mixer_delta[field] = {"before": before_value, "after": after_value}
+        if mixer_delta:
+            mixer_changes.append({
+                "track_index": track_index,
+                "track_name": after_track.get("track_name") or before_track.get("track_name"),
+                "changes": mixer_delta
+            })
+
+        before_devices = before_track.get("devices", []) if isinstance(before_track.get("devices"), list) else []
+        after_devices = after_track.get("devices", []) if isinstance(after_track.get("devices"), list) else []
+
+        before_keyed_devices = _keyed_devices(track_index, before_devices)
+        after_keyed_devices = _keyed_devices(track_index, after_devices)
+
+        before_chain = [_device_signature(device) for device in before_keyed_devices]
+        after_chain = [_device_signature(device) for device in after_keyed_devices]
+        before_chain_keys = [
+            device.get("_resolved_device_key")
+            for device in before_keyed_devices
+            if isinstance(device.get("_resolved_device_key"), str)
+        ]
+        after_chain_keys = [
+            device.get("_resolved_device_key")
+            for device in after_keyed_devices
+            if isinstance(device.get("_resolved_device_key"), str)
+        ]
+
+        before_signatures_by_key: Dict[str, str] = {}
+        for device in before_keyed_devices:
+            device_key = device.get("_resolved_device_key")
+            if not isinstance(device_key, str):
+                continue
+            before_signatures_by_key[device_key] = _device_signature(device)
+
+        after_signatures_by_key: Dict[str, str] = {}
+        for device in after_keyed_devices:
+            device_key = device.get("_resolved_device_key")
+            if not isinstance(device_key, str):
+                continue
+            after_signatures_by_key[device_key] = _device_signature(device)
+
+        if before_chain_keys != after_chain_keys:
+            before_counts = _multiset_counts(before_chain_keys)
+            after_counts = _multiset_counts(after_chain_keys)
+
+            added_device_keys = []
+            for device_key, count in after_counts.items():
+                delta = count - before_counts.get(device_key, 0)
+                for _ in range(max(0, delta)):
+                    added_device_keys.append(device_key)
+
+            removed_device_keys = []
+            for device_key, count in before_counts.items():
+                delta = count - after_counts.get(device_key, 0)
+                for _ in range(max(0, delta)):
+                    removed_device_keys.append(device_key)
+
+            added_devices = [after_signatures_by_key.get(key, key) for key in added_device_keys]
+            removed_devices = [before_signatures_by_key.get(key, key) for key in removed_device_keys]
+
+            device_chain_changes.append({
+                "track_index": track_index,
+                "track_name": after_track.get("track_name") or before_track.get("track_name"),
+                "before_chain": before_chain,
+                "after_chain": after_chain,
+                "before_chain_keys": before_chain_keys,
+                "after_chain_keys": after_chain_keys,
+                "added_devices": added_devices,
+                "removed_devices": removed_devices,
+                "added_device_keys": added_device_keys,
+                "removed_device_keys": removed_device_keys,
+                "reordered": (
+                    sorted(before_chain_keys) == sorted(after_chain_keys)
+                    and before_chain_keys != after_chain_keys
+                )
+            })
+
+        before_by_device_key = {}
+        for device in before_keyed_devices:
+            device_key = device.get("_resolved_device_key")
+            if isinstance(device_key, str):
+                before_by_device_key[device_key] = device
+
+        after_by_device_key = {}
+        for device in after_keyed_devices:
+            device_key = device.get("_resolved_device_key")
+            if isinstance(device_key, str):
+                after_by_device_key[device_key] = device
+
+        for device_key in sorted(set(before_by_device_key.keys()) & set(after_by_device_key.keys())):
+            before_device = before_by_device_key[device_key]
+            after_device = after_by_device_key[device_key]
+
+            before_hash = before_device.get("snapshot_hash")
+            after_hash = after_device.get("snapshot_hash")
+            if isinstance(before_hash, str) and isinstance(after_hash, str) and before_hash != after_hash:
+                changed_device_hashes.append({
+                    "track_index": track_index,
+                    "track_name": after_track.get("track_name") or before_track.get("track_name"),
+                    "device_key": device_key,
+                    "device_index": after_device.get("device_index"),
+                    "before_device_index": before_device.get("device_index"),
+                    "after_device_index": after_device.get("device_index"),
+                    "device_name": after_device.get("device_name") or after_device.get("name"),
+                    "class_name": after_device.get("class_name"),
+                    "before_hash": before_hash,
+                    "after_hash": after_hash
+                })
+
+    parameter_diffs: List[Dict[str, Any]] = []
+    if include_parameter_diffs and changed_device_hashes:
+        before_sidecar_path = _resolve_snapshot_sidecar_file(before_payload, before_path)
+        after_sidecar_path = _resolve_snapshot_sidecar_file(after_payload, after_path)
+
+        before_sidecar = _safe_json_file_load(before_sidecar_path) if isinstance(before_sidecar_path, str) else None
+        after_sidecar = _safe_json_file_load(after_sidecar_path) if isinstance(after_sidecar_path, str) else None
+
+        before_sidecar_devices = before_sidecar.get("devices", {}) if isinstance(before_sidecar, dict) else {}
+        after_sidecar_devices = after_sidecar.get("devices", {}) if isinstance(after_sidecar, dict) else {}
+
+        if not isinstance(before_sidecar_devices, dict):
+            before_sidecar_devices = {}
+        if not isinstance(after_sidecar_devices, dict):
+            after_sidecar_devices = {}
+
+        if not before_sidecar_devices:
+            warnings.append("before_parameter_sidecar_unavailable")
+        if not after_sidecar_devices:
+            warnings.append("after_parameter_sidecar_unavailable")
+
+        max_parameter_diffs = 50
+        for device_change in changed_device_hashes:
+            track_index = device_change.get("track_index")
+            if not isinstance(track_index, int):
+                continue
+
+            device_key = device_change.get("device_key")
+            before_device_index = device_change.get("before_device_index")
+            after_device_index = device_change.get("after_device_index")
+
+            before_device_payload = _sidecar_device_payload(
+                before_sidecar_devices,
+                device_key=device_key,
+                track_index=track_index,
+                device_index=before_device_index
+            )
+            after_device_payload = _sidecar_device_payload(
+                after_sidecar_devices,
+                device_key=device_key,
+                track_index=track_index,
+                device_index=after_device_index
+            )
+
+            before_param_map = _snapshot_parameter_index_map(before_device_payload.get("parameters", []))
+            after_param_map = _snapshot_parameter_index_map(after_device_payload.get("parameters", []))
+
+            if not before_param_map and not after_param_map:
+                continue
+
+            changed_parameters_all = []
+
+            for parameter_index in sorted(set(before_param_map.keys()) & set(after_param_map.keys())):
+                before_parameter = before_param_map[parameter_index]
+                after_parameter = after_param_map[parameter_index]
+                before_value = before_parameter.get("value")
+                after_value = after_parameter.get("value")
+                before_name = before_parameter.get("name")
+                after_name = after_parameter.get("name")
+                if before_value == after_value:
+                    continue
+
+                row = {
+                    "parameter_index": parameter_index,
+                    "name": after_name if isinstance(after_name, str) else before_name,
+                    "before": before_value,
+                    "after": after_value
+                }
+                if isinstance(before_value, (int, float)) and isinstance(after_value, (int, float)):
+                    row["delta"] = float(after_value) - float(before_value)
+                changed_parameters_all.append(row)
+
+            truncated = False
+            changed_parameter_count = len(changed_parameters_all)
+            changed_parameters = changed_parameters_all
+            if changed_parameter_count > max_parameter_diffs:
+                changed_parameters = changed_parameters_all[:max_parameter_diffs]
+                truncated = True
+
+            if changed_parameters_all:
+                parameter_diffs.append({
+                    "device_key": device_key,
+                    "track_index": track_index,
+                    "track_name": device_change.get("track_name"),
+                    "device_index": device_change.get("device_index"),
+                    "device_name": device_change.get("device_name"),
+                    "changed_parameter_count": changed_parameter_count,
+                    "changes": changed_parameters,
+                    "changed_parameters": changed_parameters,
+                    "added_parameters": [],
+                    "removed_parameters": [],
+                    "truncated": truncated
+                })
+
+    before_id = before_payload.get("snapshot_id")
+    if not isinstance(before_id, str):
+        before_id = os.path.basename(before_path).replace(".json", "")
+    after_id = after_payload.get("snapshot_id")
+    if not isinstance(after_id, str):
+        after_id = os.path.basename(after_path).replace(".json", "")
+
+    result = {
+        "ok": True,
+        "before_snapshot_id": before_id,
+        "after_snapshot_id": after_id,
+        "before_file_path": before_path,
+        "after_file_path": after_path,
+        "summary": {
+            "session_changes": len(session_changes),
+            "added_tracks": len(added_tracks),
+            "removed_tracks": len(removed_tracks),
+            "mixer_changes": len(mixer_changes),
+            "device_chain_changes": len(device_chain_changes),
+            "changed_device_hashes": len(changed_device_hashes),
+            "parameter_diff_devices": len(parameter_diffs)
+        },
+        "session_changes": session_changes,
+        "added_tracks": added_tracks,
+        "removed_tracks": removed_tracks,
+        "mixer_changes": mixer_changes,
+        "device_chain_changes": device_chain_changes,
+        "changed_device_hashes": changed_device_hashes
+    }
+    if include_parameter_diffs:
+        result["parameter_diffs"] = parameter_diffs
+    if warnings:
+        result["warnings"] = warnings
+    return result
+
+
+@mcp.tool()
+def summarize_diff_for_llm(ctx: Context, before_snapshot_id: str, after_snapshot_id: str) -> Dict[str, Any]:
+    """
+    Build deterministic, compact change summary strings from a project snapshot diff.
+    """
+    diff_payload = diff_project_state(
+        ctx=ctx,
+        before_snapshot_id=before_snapshot_id,
+        after_snapshot_id=after_snapshot_id,
+        include_parameter_diffs=True
+    )
+    if not isinstance(diff_payload, dict):
+        return {
+            "ok": False,
+            "error": "diff_failed",
+            "message": "diff_project_state returned invalid payload"
+        }
+    if diff_payload.get("ok") is not True:
+        return diff_payload
+
+    def _device_label(raw: Any) -> str:
+        if isinstance(raw, str) and raw:
+            if "|" in raw:
+                return raw.split("|", 1)[0]
+            return raw
+        return "Unknown Device"
+
+    def _format_delta(value: Any) -> str:
+        if isinstance(value, (int, float)):
+            return f"{float(value):+.4f}"
+        return "changed"
+
+    details: List[str] = []
+
+    mixer_changes = diff_payload.get("mixer_changes", [])
+    if isinstance(mixer_changes, list):
+        for mixer_change in sorted(
+            [row for row in mixer_changes if isinstance(row, dict)],
+            key=lambda item: int(item.get("track_index", -1))
+        ):
+            track_index = mixer_change.get("track_index")
+            changes = mixer_change.get("changes", {})
+            if not isinstance(changes, dict):
+                continue
+            for field in ["volume", "panning", "mute", "solo", "arm"]:
+                if field not in changes or not isinstance(changes[field], dict):
+                    continue
+                before_value = changes[field].get("before")
+                after_value = changes[field].get("after")
+                details.append(
+                    f"Track {track_index}: {field} {before_value} -> {after_value}"
+                )
+
+    device_chain_changes = diff_payload.get("device_chain_changes", [])
+    if isinstance(device_chain_changes, list):
+        for chain_change in sorted(
+            [row for row in device_chain_changes if isinstance(row, dict)],
+            key=lambda item: int(item.get("track_index", -1))
+        ):
+            track_index = chain_change.get("track_index")
+            removed_devices = chain_change.get("removed_devices", [])
+            if isinstance(removed_devices, list):
+                for removed in removed_devices:
+                    details.append(f"Track {track_index}: Removed {_device_label(removed)}")
+            added_devices = chain_change.get("added_devices", [])
+            if isinstance(added_devices, list):
+                for added in added_devices:
+                    details.append(f"Track {track_index}: Added {_device_label(added)}")
+            if chain_change.get("reordered") is True:
+                details.append(f"Track {track_index}: Reordered device chain")
+
+    parameter_diffs = diff_payload.get("parameter_diffs", [])
+    if isinstance(parameter_diffs, list):
+        sorted_parameter_diffs = sorted(
+            [row for row in parameter_diffs if isinstance(row, dict)],
+            key=lambda item: (
+                int(item.get("track_index", -1)),
+                str(item.get("device_name") or "")
+            )
+        )
+        for parameter_diff in sorted_parameter_diffs:
+            track_index = parameter_diff.get("track_index")
+            device_name = parameter_diff.get("device_name")
+            if not isinstance(device_name, str) or not device_name:
+                device_name = "Unknown Device"
+            changes = parameter_diff.get("changes", [])
+            if not isinstance(changes, list) or not changes:
+                continue
+            compact_changes = []
+            for change in changes[:5]:
+                if not isinstance(change, dict):
+                    continue
+                parameter_name = change.get("name")
+                if not isinstance(parameter_name, str) or not parameter_name:
+                    parameter_name = f"Param {change.get('parameter_index')}"
+                if ":" in parameter_name:
+                    parameter_name = parameter_name.split(":")[-1].strip() or parameter_name
+                if "delta" in change:
+                    compact_changes.append(f"{parameter_name} {_format_delta(change.get('delta'))}")
+                else:
+                    compact_changes.append(f"{parameter_name} changed")
+            if compact_changes:
+                details.append(
+                    f"Track {track_index}: {device_name} - {', '.join(compact_changes)}"
+                )
+
+    devices_added = 0
+    devices_removed = 0
+    if isinstance(device_chain_changes, list):
+        for chain_change in device_chain_changes:
+            if not isinstance(chain_change, dict):
+                continue
+            added_devices = chain_change.get("added_devices", [])
+            removed_devices = chain_change.get("removed_devices", [])
+            if isinstance(added_devices, list):
+                devices_added += len(added_devices)
+            if isinstance(removed_devices, list):
+                devices_removed += len(removed_devices)
+
+    details = sorted(dict.fromkeys(details))
+
+    return {
+        "ok": True,
+        "before_snapshot_id": diff_payload.get("before_snapshot_id"),
+        "after_snapshot_id": diff_payload.get("after_snapshot_id"),
+        "summary": {
+            "mixer_changes": len(mixer_changes) if isinstance(mixer_changes, list) else 0,
+            "devices_added": devices_added,
+            "devices_removed": devices_removed,
+            "devices_modified": len(parameter_diffs) if isinstance(parameter_diffs, list) else 0
+        },
+        "details": details
+    }
 
 
 @mcp.tool()
