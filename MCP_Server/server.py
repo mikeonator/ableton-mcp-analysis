@@ -22,6 +22,16 @@ except Exception:
     sf = None
 
 try:
+    import pyloudnorm as pyln
+except Exception:
+    pyln = None
+
+try:
+    from scipy import signal as sp_signal
+except Exception:
+    sp_signal = None
+
+try:
     from pydub import AudioSegment
 except Exception:
     AudioSegment = None
@@ -211,9 +221,24 @@ mcp = FastMCP(
 # Global connection for resources
 _ableton_connection = None
 
-_SOURCE_CACHE_VERSION = 1
+_SOURCE_CACHE_VERSION = 2
 _SOURCE_CACHE_DIR = os.path.expanduser("~/.ableton_mcp_analysis/cache")
 _SUPPORTED_AUDIO_EXTENSIONS = {".wav", ".aiff", ".aif", ".mp3", ".m4a", ".flac"}
+_KNOWN_BROWSER_ROOTS = [
+    "Audio Effects",
+    "Plugins",
+    "MIDI Effects",
+    "Instruments",
+    "Max for Live",
+    "Sounds",
+    "Drums",
+    "Clips",
+    "Current Project",
+    "Packs",
+    "Samples",
+    "User Library",
+    "User Folders"
+]
 
 def get_ableton_connection():
     """Get or create a persistent Ableton connection"""
@@ -411,8 +436,8 @@ def _is_source_cache_valid(
     return True
 
 
-def _decode_audio_samples(file_path: str) -> Tuple[Any, int, int]:
-    """Decode audio and return mono samples, sample rate, and original channels."""
+def _decode_audio_samples(file_path: str) -> Tuple[Any, int, int, str]:
+    """Decode audio and return NxC samples, sample rate, channels, and backend."""
     extension = os.path.splitext(file_path)[1].lower()
     if extension not in _SUPPORTED_AUDIO_EXTENSIONS:
         raise SourceAnalysisError(
@@ -430,8 +455,7 @@ def _decode_audio_samples(file_path: str) -> Tuple[Any, int, int]:
             if decoded.size == 0:
                 raise SourceAnalysisError("decode_failed", "Decoded audio is empty")
             channels = int(decoded.shape[1])
-            mono = decoded.mean(axis=1).astype(np.float32)
-            return mono, int(sample_rate), channels
+            return decoded.astype(np.float32), int(sample_rate), channels, "soundfile"
         except SourceAnalysisError:
             raise
         except Exception as exc:
@@ -450,13 +474,12 @@ def _decode_audio_samples(file_path: str) -> Tuple[Any, int, int]:
 
             if channels > 1:
                 pcm = pcm.reshape((-1, channels))
-                mono = pcm.mean(axis=1)
             else:
-                mono = pcm
+                pcm = pcm.reshape((-1, 1))
 
             full_scale = float(2 ** max(1, (8 * sample_width - 1)))
-            mono = (mono / full_scale).astype(np.float32)
-            return mono, sample_rate, channels
+            normalized = (pcm / full_scale).astype(np.float32)
+            return normalized, sample_rate, channels, "pydub"
         except SourceAnalysisError:
             raise
         except Exception as exc:
@@ -487,40 +510,101 @@ def _band_energy_db(spectrum: Any, frequencies: Any, low_hz: float, high_hz: flo
     return float(20.0 * math.log10(max(band_mag, 1e-12)))
 
 
+def _safe_db(value: float, floor_db: float = -120.0) -> float:
+    """Convert linear amplitude to dB with flooring."""
+    if value <= 0.0:
+        return floor_db
+    db_value = 20.0 * math.log10(value)
+    return max(floor_db, float(db_value))
+
+
+def _average_spectrum_welch(signal_mono: Any, sample_rate: int) -> Tuple[Any, Any]:
+    """Build a Welch-style averaged magnitude spectrum."""
+    if np is None:
+        raise SourceAnalysisError("unsupported_decode_backend", "numpy is not available")
+
+    frame_size = 4096
+    hop = frame_size // 2
+    if signal_mono.shape[0] < frame_size:
+        padded = np.pad(signal_mono, (0, frame_size - signal_mono.shape[0]))
+        signal_mono = padded.astype(np.float32)
+
+    window = np.hanning(frame_size).astype(np.float32)
+    spectra = []
+    for start in range(0, signal_mono.shape[0] - frame_size + 1, hop):
+        frame = signal_mono[start:start + frame_size]
+        if frame.shape[0] < frame_size:
+            continue
+        frame_spectrum = np.abs(np.fft.rfft(frame * window))
+        spectra.append(frame_spectrum)
+
+    if not spectra:
+        frame_spectrum = np.abs(np.fft.rfft(signal_mono[:frame_size] * window))
+        spectra = [frame_spectrum]
+
+    stacked = np.stack(spectra, axis=0)
+    avg_spectrum = np.mean(stacked, axis=0)
+    frequencies = np.fft.rfftfreq(frame_size, d=1.0 / float(sample_rate))
+    return frequencies, avg_spectrum
+
+
 def _find_resonant_peaks(frequencies: Any, spectrum_db: Any) -> List[Dict[str, float]]:
-    """Find top local spectral spikes above a smoothed baseline."""
-    if np is None or len(spectrum_db) < 5:
+    """Find robust spectral peaks from residual over smoothed baseline."""
+    if np is None or len(spectrum_db) < 8:
         return []
 
-    kernel_size = max(9, int(len(spectrum_db) / 256))
+    kernel_size = max(31, int(len(spectrum_db) / 96))
     if kernel_size % 2 == 0:
         kernel_size += 1
     kernel = np.ones(kernel_size, dtype=np.float32) / float(kernel_size)
     baseline = np.convolve(spectrum_db, kernel, mode="same")
     prominence = spectrum_db - baseline
 
-    candidates = []
-    for idx in range(1, len(spectrum_db) - 1):
-        hz = float(frequencies[idx])
-        if hz < 20.0 or hz > 12000.0:
-            continue
-        if spectrum_db[idx] <= spectrum_db[idx - 1] or spectrum_db[idx] <= spectrum_db[idx + 1]:
-            continue
-        if prominence[idx] < 2.5:
-            continue
-        candidates.append((idx, float(prominence[idx])))
+    valid_mask = (frequencies >= 80.0) & (frequencies <= 12000.0)
+    valid_indices = np.where(valid_mask)[0]
+    if valid_indices.size < 3:
+        return []
 
-    candidates.sort(key=lambda item: item[1], reverse=True)
+    candidate_indices: List[int] = []
+    if sp_signal is not None:
+        valid_prom = prominence[valid_indices]
+        peak_local_indices, props = sp_signal.find_peaks(valid_prom, prominence=6.0, distance=3)
+        candidate_indices = [int(valid_indices[idx]) for idx in peak_local_indices]
+    else:
+        for idx in valid_indices[1:-1]:
+            if prominence[idx] < 6.0:
+                continue
+            if spectrum_db[idx] <= spectrum_db[idx - 1] or spectrum_db[idx] <= spectrum_db[idx + 1]:
+                continue
+            candidate_indices.append(int(idx))
+
+    def _passes_spacing(existing_hz: List[float], hz: float) -> bool:
+        min_ratio = 2.0 ** (1.0 / 12.0)
+        for val in existing_hz:
+            ratio = max(hz, val) / max(1e-9, min(hz, val))
+            if ratio < min_ratio:
+                return False
+        return True
+
+    candidates = sorted(
+        [(idx, float(prominence[idx])) for idx in candidate_indices],
+        key=lambda item: item[1],
+        reverse=True
+    )
 
     peaks: List[Dict[str, float]] = []
+    selected_hz: List[float] = []
     for idx, prom in candidates:
+        if prom < 6.0:
+            continue
         hz = float(frequencies[idx])
-        if any(abs(existing["hz"] - hz) < 60.0 for existing in peaks):
+        if not _passes_spacing(selected_hz, hz):
             continue
         peaks.append({
             "hz": round(hz, 2),
             "prominence_db": round(prom, 2)
         })
+        selected_hz.append(hz)
         if len(peaks) >= 5:
             break
 
@@ -534,7 +618,12 @@ def _format_frequency(hz: float) -> str:
     return f"{hz:.0f} Hz"
 
 
-def _build_source_summary(band_energies_db: Dict[str, float], peaks: List[Dict[str, float]]) -> str:
+def _build_source_summary(
+    band_energies_db: Dict[str, float],
+    peaks: List[Dict[str, float]],
+    lufs_integrated: Optional[float],
+    true_peak_dbtp: Optional[float]
+) -> str:
     """Build short deterministic source summary."""
     descriptors: List[str] = []
     sub = band_energies_db.get("sub_20_60", -120.0)
@@ -562,9 +651,15 @@ def _build_source_summary(band_energies_db: Dict[str, float], peaks: List[Dict[s
     if not descriptors:
         descriptors.append("Balanced spectrum")
 
+    if lufs_integrated is not None:
+        descriptors.append(f"LUFS {lufs_integrated:.1f}")
+
+    if true_peak_dbtp is not None:
+        descriptors.append(f"true peak {true_peak_dbtp:+.1f} dBTP")
+
     if peaks:
         top_peak = peaks[0]
-        descriptors.append(f"resonance around {_format_frequency(float(top_peak['hz']))}")
+        descriptors.append(f"resonance ~{_format_frequency(float(top_peak['hz']))}")
 
     summary = ", ".join(descriptors)
     if not summary.endswith("."):
@@ -577,25 +672,53 @@ def _analyze_audio_source(file_path: str, stat_size: int, stat_mtime: float) -> 
     if np is None:
         raise SourceAnalysisError("unsupported_decode_backend", "numpy is not available")
 
-    mono, sample_rate, channels = _decode_audio_samples(file_path)
-    if mono.size == 0:
+    samples, sample_rate, channels, decode_backend = _decode_audio_samples(file_path)
+    if samples.size == 0:
         raise SourceAnalysisError("decode_failed", "Decoded audio is empty")
 
-    peak = float(np.max(np.abs(mono)))
+    analysis_notes: List[str] = [f"decode_backend={decode_backend}"]
+    mono = samples.mean(axis=1).astype(np.float32)
+    sample_peak = float(np.max(np.abs(samples)))
     rms = float(np.sqrt(np.mean(np.square(mono, dtype=np.float64))))
-    crest_factor_db = float(20.0 * math.log10(max(peak, 1e-12) / max(rms, 1e-12)))
+    crest_factor_db = float(_safe_db(max(sample_peak, 1e-12) / max(rms, 1e-12)))
+    sample_peak_dbfs = _safe_db(sample_peak)
+
+    true_peak = sample_peak
+    true_peak_dbtp = sample_peak_dbfs
+    if sp_signal is not None:
+        try:
+            channel_true_peaks = []
+            for channel_index in range(samples.shape[1]):
+                oversampled = sp_signal.resample_poly(samples[:, channel_index], up=4, down=1)
+                channel_true_peaks.append(float(np.max(np.abs(oversampled))))
+            if channel_true_peaks:
+                true_peak = max(channel_true_peaks)
+                true_peak_dbtp = _safe_db(true_peak)
+        except Exception as exc:
+            analysis_notes.append(f"true_peak_fallback_sample_peak ({str(exc)})")
+    else:
+        analysis_notes.append("true_peak_fallback_sample_peak (scipy unavailable)")
+
+    lufs_integrated: Optional[float] = None
+    if pyln is not None:
+        try:
+            meter = pyln.Meter(sample_rate)
+            if channels == 1:
+                lufs_integrated = float(meter.integrated_loudness(mono.astype(np.float64)))
+            else:
+                lufs_integrated = float(meter.integrated_loudness(samples.astype(np.float64)))
+        except Exception as exc:
+            analysis_notes.append(f"lufs_unavailable ({str(exc)})")
+    else:
+        analysis_notes.append("lufs_unavailable (pyloudnorm unavailable)")
 
     # Analyze at most 120 seconds for predictable runtime on large files.
     max_samples = int(sample_rate * 120)
     analysis_signal = mono[:max_samples] if mono.shape[0] > max_samples else mono
-    fft_size = int(analysis_signal.shape[0])
-    if fft_size < 32:
+    if analysis_signal.shape[0] < 32:
         raise SourceAnalysisError("decode_failed", "Audio too short for spectral analysis")
 
-    window = np.hanning(fft_size).astype(np.float32)
-    windowed = analysis_signal * window
-    spectrum = np.abs(np.fft.rfft(windowed))
-    frequencies = np.fft.rfftfreq(fft_size, d=1.0 / float(sample_rate))
+    frequencies, spectrum = _average_spectrum_welch(analysis_signal, sample_rate)
     spectrum_db = 20.0 * np.log10(np.maximum(spectrum, 1e-12))
 
     band_energies_db = {
@@ -607,7 +730,12 @@ def _analyze_audio_source(file_path: str, stat_size: int, stat_mtime: float) -> 
         "air_6000_12000": round(_band_energy_db(spectrum, frequencies, 6000.0, 12000.0), 3),
     }
     resonant_peaks_hz = _find_resonant_peaks(frequencies, spectrum_db)
-    summary = _build_source_summary(band_energies_db, resonant_peaks_hz)
+    summary = _build_source_summary(
+        band_energies_db=band_energies_db,
+        peaks=resonant_peaks_hz,
+        lufs_integrated=lufs_integrated,
+        true_peak_dbtp=true_peak_dbtp
+    )
 
     return {
         "ok": True,
@@ -620,13 +748,265 @@ def _analyze_audio_source(file_path: str, stat_size: int, stat_mtime: float) -> 
         "duration_sec": round(float(mono.shape[0]) / float(sample_rate), 4),
         "sample_rate": int(sample_rate),
         "channels": int(channels),
-        "peak": round(peak, 6),
+        "peak": round(sample_peak, 6),
+        "sample_peak": round(sample_peak, 6),
+        "sample_peak_dbfs": round(sample_peak_dbfs, 3),
+        "true_peak": round(float(true_peak), 6),
+        "true_peak_dbtp": round(float(true_peak_dbtp), 3),
+        "lufs_integrated": None if lufs_integrated is None else round(float(lufs_integrated), 3),
         "rms": round(rms, 6),
         "crest_factor_db": round(crest_factor_db, 3),
         "band_energies_db": band_energies_db,
         "resonant_peaks_hz": resonant_peaks_hz,
-        "summary": summary
+        "summary": summary,
+        "analysis_notes": analysis_notes
     }
+
+
+def _coerce_json_dict(payload: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Parse payload into a dict when possible."""
+    if isinstance(payload, dict):
+        return payload, None
+
+    if isinstance(payload, str):
+        stripped = payload.strip()
+        if not stripped:
+            return None, "empty_payload"
+        if stripped.startswith("Error"):
+            return None, stripped
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, dict):
+                return parsed, None
+            return None, "parsed_json_not_dict"
+        except Exception:
+            return None, "json_parse_failed"
+
+    return None, "unsupported_payload_type"
+
+
+def _normalize_browser_token(token: str) -> str:
+    """Normalize browser token for comparison and deduping."""
+    lowered = token.strip().lower()
+    normalized = []
+    prev_is_sep = False
+    for ch in lowered:
+        if ch.isalnum():
+            normalized.append(ch)
+            prev_is_sep = False
+        else:
+            if not prev_is_sep:
+                normalized.append("_")
+                prev_is_sep = True
+    normalized_token = "".join(normalized).strip("_")
+    return normalized_token
+
+
+def _browser_path_key(parts: List[str]) -> str:
+    """Build a normalized key for browser paths."""
+    return "/".join(_normalize_browser_token(part) for part in parts if isinstance(part, str) and part.strip())
+
+
+def _infer_inventory_item_type(item: Dict[str, Any], item_name: str) -> Optional[str]:
+    """Infer browser item type from known fields when possible."""
+    if _safe_bool(item.get("is_device")):
+        return "device"
+
+    textual_fields = []
+    for key in ("type", "item_type", "kind", "class_name", "class_display_name", "uri"):
+        value = item.get(key)
+        if isinstance(value, str):
+            textual_fields.append(value.lower())
+
+    joined = " ".join(textual_fields + [item_name.lower()])
+    if "instrument" in joined:
+        return "instrument"
+    if "audio effect" in joined:
+        return "audio_effect"
+    if "midi effect" in joined:
+        return "midi_effect"
+    if "max for live" in joined or "m4l" in joined:
+        return "max_for_live"
+    if "preset" in joined:
+        return "preset"
+    if "rack" in joined:
+        return "rack"
+    if "device" in joined or "plugin" in joined or "plug-in" in joined:
+        return "device"
+    return None
+
+
+def _is_clearly_preset_item(item: Dict[str, Any], item_name: str) -> bool:
+    """Return True when an item is clearly a preset/rack artifact."""
+    inferred = _infer_inventory_item_type(item, item_name)
+    if inferred in {"preset", "rack"}:
+        return True
+
+    lower_name = item_name.lower()
+    preset_extensions = {".adg", ".adv", ".aupreset", ".vstpreset", ".fxp", ".fxb"}
+    extension = os.path.splitext(lower_name)[1]
+    if extension in preset_extensions:
+        return True
+
+    uri = item.get("uri")
+    if isinstance(uri, str):
+        uri_lower = uri.lower()
+        if "preset" in uri_lower or "rack" in uri_lower:
+            return True
+
+    return False
+
+
+def _humanize_browser_root_name(raw_name: str) -> str:
+    """Convert root labels/tokens into a stable display name."""
+    collapsed = " ".join(raw_name.strip().replace("_", " ").split())
+    if not collapsed:
+        return ""
+
+    lowercase_words = {"a", "an", "and", "for", "in", "of", "on", "or", "the", "to"}
+    uppercase_words = {"api", "au", "cv", "eq", "fx", "lfo", "m4l", "midi", "osc", "vst"}
+
+    words = []
+    for index, token in enumerate(collapsed.split(" ")):
+        lower = token.lower()
+        if lower in uppercase_words:
+            words.append(lower.upper())
+        elif index > 0 and lower in lowercase_words:
+            words.append(lower)
+        else:
+            words.append(lower.capitalize())
+
+    return " ".join(words)
+
+
+def _looks_like_browser_root_token(token: str) -> bool:
+    """Return True for likely browser root tokens and False for API methods/properties."""
+    normalized = _normalize_browser_token(token)
+    if not normalized:
+        return False
+    if normalized.startswith("add_") or normalized.startswith("remove_"):
+        return False
+    if normalized.endswith("_listener") or normalized.endswith("_has_listener"):
+        return False
+
+    excluded = {
+        "colors",
+        "filter_type",
+        "full_refresh",
+        "hotswap_target",
+        "legacy_libraries",
+        "load_item",
+        "preview_item",
+        "relation_to_hotswap_target",
+        "stop_preview"
+    }
+    return normalized not in excluded
+
+
+def _extract_browser_root_entries(browser_tree: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Extract top-level browser roots from varying tree schemas."""
+    entries: List[Dict[str, Any]] = []
+    entries_by_name: Dict[str, Dict[str, Any]] = {}
+
+    def ensure_entry(display_name: str) -> Optional[Dict[str, Any]]:
+        name = display_name.strip()
+        if not name:
+            return None
+        if name in entries_by_name:
+            return entries_by_name[name]
+        entry = {
+            "display_name": name,
+            "path_candidates": []
+        }
+        entries.append(entry)
+        entries_by_name[name] = entry
+        return entry
+
+    def add_path_candidate(entry: Dict[str, Any], value: Any) -> None:
+        if isinstance(value, (int, float)):
+            candidate = str(value).strip()
+        elif isinstance(value, str):
+            candidate = value.strip()
+        else:
+            return
+
+        if not candidate:
+            return
+
+        if candidate not in entry["path_candidates"]:
+            entry["path_candidates"].append(candidate)
+
+    def add_entry(display_name: str, path_candidates: Optional[List[Any]] = None) -> None:
+        entry = ensure_entry(display_name)
+        if entry is None:
+            return
+
+        candidate_values = list(path_candidates or [])
+        candidate_values.extend([
+            display_name,
+            _normalize_browser_token(display_name)
+        ])
+        for value in candidate_values:
+            add_path_candidate(entry, value)
+
+    def add_entry_from_dict(item: Dict[str, Any]) -> None:
+        name_value: Optional[str] = None
+        for key in ("name", "display_name", "title", "label"):
+            raw_name = item.get(key)
+            if isinstance(raw_name, str) and raw_name.strip():
+                name_value = raw_name
+                break
+        if name_value is None:
+            return
+
+        display_name = _humanize_browser_root_name(name_value)
+        path_candidates: List[Any] = [
+            item.get("path"),
+            item.get("path_key"),
+            item.get("key"),
+            item.get("id"),
+            item.get("uri"),
+            name_value
+        ]
+        add_entry(display_name, path_candidates)
+
+    def parse_collection(items: List[Any]) -> None:
+        dict_items = [item for item in items if isinstance(item, dict)]
+        if dict_items:
+            for item in dict_items:
+                add_entry_from_dict(item)
+            return
+
+        string_items = [item for item in items if isinstance(item, str)]
+        for token in string_items:
+            if not _looks_like_browser_root_token(token):
+                continue
+            add_entry(_humanize_browser_root_name(token), [token])
+
+    if isinstance(browser_tree, dict):
+        for value in browser_tree.values():
+            if isinstance(value, list):
+                parse_collection(value)
+
+    # If top-level extraction failed, fallback to recursive list scanning.
+    if not entries:
+        def find_lists(node: Any, depth: int = 0) -> None:
+            if depth > 5:
+                return
+            if isinstance(node, dict):
+                for value in node.values():
+                    find_lists(value, depth + 1)
+                return
+            if isinstance(node, list):
+                parse_collection(node)
+                if entries:
+                    return
+                for value in node:
+                    find_lists(value, depth + 1)
+
+        find_lists(browser_tree, 0)
+
+    return entries
 
 
 # Core Tool endpoints
@@ -1283,6 +1663,445 @@ def get_detail_clip_source_path(ctx: Context) -> Dict[str, Any]:
         return {
             "error": "get_detail_clip_source_path_failed",
             "message": str(e)
+        }
+
+
+@mcp.tool()
+def get_device_inventory(
+    ctx: Context,
+    roots: Optional[List[str]] = None,
+    max_depth: int = 5,
+    max_items_per_folder: int = 500,
+    include_presets: bool = False
+) -> Dict[str, Any]:
+    """
+    Enumerate loadable devices/effects/instruments from Ableton's browser.
+
+    Parameters:
+    - roots: Optional browser roots to scan. Defaults to ["Audio Effects", "Plugins"].
+    - max_depth: Maximum recursive folder depth
+    - max_items_per_folder: Hard cap per folder scan
+    - include_presets: Include clearly preset/rack items when True
+    """
+    try:
+        ableton = get_ableton_connection()
+        browser_tree = ableton.send_command("get_browser_tree", {"category_type": "all"})
+        if not isinstance(browser_tree, dict) or not browser_tree:
+            return {
+                "ok": False,
+                "error": "browser_tree_unavailable"
+            }
+
+        root_entries = _extract_browser_root_entries(browser_tree)
+        if not root_entries:
+            return {
+                "ok": False,
+                "error": "browser_tree_unavailable"
+            }
+
+        try:
+            depth_limit = max(0, int(max_depth))
+        except Exception:
+            depth_limit = 5
+        try:
+            items_per_folder_limit = max(1, int(max_items_per_folder))
+        except Exception:
+            items_per_folder_limit = 500
+
+        overall_item_cap = 5000
+        max_folder_calls = 300
+        folder_calls = 0
+        scanned_roots: List[str] = []
+        discovered_roots = [entry.get("display_name") for entry in root_entries if isinstance(entry.get("display_name"), str)]
+        available_roots: List[str] = []
+        seen_available_roots = set()
+        for root_name in discovered_roots + _KNOWN_BROWSER_ROOTS:
+            if not isinstance(root_name, str):
+                continue
+            normalized_name = root_name.strip()
+            if not normalized_name or normalized_name in seen_available_roots:
+                continue
+            seen_available_roots.add(normalized_name)
+            available_roots.append(normalized_name)
+        devices: List[Dict[str, Any]] = []
+        folders_truncated: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+        truncated = False
+
+        device_dedupe_keys = set()
+        visited_folders = set()
+
+        root_lookup = {
+            entry["display_name"]: entry
+            for entry in root_entries
+            if isinstance(entry.get("display_name"), str)
+        }
+        for root_name in _KNOWN_BROWSER_ROOTS:
+            if root_name in root_lookup:
+                continue
+            root_lookup[root_name] = {
+                "display_name": root_name,
+                "path_candidates": [f"query:{root_name}", root_name, _normalize_browser_token(root_name)]
+            }
+
+        if roots is None:
+            requested_roots = ["Audio Effects", "Plugins"]
+        elif isinstance(roots, list):
+            requested_roots = [
+                value.strip() for value in roots
+                if isinstance(value, str) and value.strip()
+            ]
+        else:
+            requested_roots = []
+
+        seen_requested = set()
+        deduped_requested_roots: List[str] = []
+        for root_name in requested_roots:
+            if root_name in seen_requested:
+                continue
+            seen_requested.add(root_name)
+            deduped_requested_roots.append(root_name)
+        requested_roots = deduped_requested_roots
+
+        valid_roots = [root_name for root_name in requested_roots if root_name in root_lookup]
+        roots_not_found = [root_name for root_name in requested_roots if root_name not in root_lookup]
+
+        def fetch_folder(path_key_parts: List[str]) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+            nonlocal folder_calls
+            if folder_calls >= max_folder_calls:
+                return None, "max_folder_calls"
+            folder_calls += 1
+            path_string = "/".join(path_key_parts)
+            try:
+                response = ableton.send_command("get_browser_items_at_path", {"path": path_string})
+            except Exception as exc:
+                return None, str(exc)
+
+            if not isinstance(response, dict):
+                return None, f"invalid_response_type:{type(response)}"
+            if response.get("error"):
+                return None, str(response.get("error"))
+
+            items = response.get("items", [])
+            if not isinstance(items, list):
+                return [], None
+            normalized_items = [item for item in items if isinstance(item, dict)]
+            return normalized_items, None
+
+        def fetch_root_folder(root_entry: Dict[str, Any]) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str], Optional[str]]:
+            path_candidates = root_entry.get("path_candidates", [])
+            if not isinstance(path_candidates, list):
+                return None, None, "no_path_candidates"
+
+            last_error: Optional[str] = None
+            seen_candidates = set()
+            for value in path_candidates:
+                if not isinstance(value, str):
+                    continue
+                candidate = value.strip()
+                if not candidate or candidate in seen_candidates:
+                    continue
+                seen_candidates.add(candidate)
+
+                items, error = fetch_folder([candidate])
+                if error is None:
+                    return items, candidate, None
+                if error == "max_folder_calls":
+                    return None, None, error
+                last_error = error
+
+            return None, None, last_error or "root_not_resolvable"
+
+        def traverse_folder(
+            path_key_parts: List[str],
+            path_display_parts: List[str],
+            depth: int,
+            prefetched_items: Optional[List[Dict[str, Any]]] = None
+        ) -> None:
+            nonlocal truncated
+            if truncated:
+                return
+
+            folder_key = _browser_path_key(path_display_parts)
+            if folder_key in visited_folders:
+                return
+            visited_folders.add(folder_key)
+
+            items = prefetched_items
+            if items is None:
+                fetched_items, error = fetch_folder(path_key_parts)
+                if error is not None:
+                    if error == "max_folder_calls":
+                        truncated = True
+                        folders_truncated.append({
+                            "path": path_display_parts,
+                            "reason": "max_folder_calls"
+                        })
+                        return
+                    errors.append({
+                        "path": path_display_parts,
+                        "error": error
+                    })
+                    return
+                items = fetched_items or []
+
+            if len(items) > items_per_folder_limit:
+                folders_truncated.append({
+                    "path": path_display_parts,
+                    "reason": "max_items_per_folder"
+                })
+                items = items[:items_per_folder_limit]
+
+            for item in items:
+                if truncated:
+                    break
+
+                item_name = item.get("name")
+                if not isinstance(item_name, str) or not item_name.strip():
+                    continue
+                item_name = item_name.strip()
+
+                item_display_path = path_display_parts + [item_name]
+                is_loadable = _safe_bool(item.get("is_loadable"))
+                is_folder = _safe_bool(item.get("is_folder"))
+
+                if is_loadable:
+                    if include_presets or not _is_clearly_preset_item(item, item_name):
+                        item_id = None
+                        for id_key in ("id", "item_id", "uri"):
+                            id_value = item.get(id_key)
+                            if isinstance(id_value, (str, int)):
+                                item_id = str(id_value)
+                                break
+
+                        dedupe_key = item_id or _browser_path_key(item_display_path)
+                        if dedupe_key not in device_dedupe_keys:
+                            device_dedupe_keys.add(dedupe_key)
+                            devices.append({
+                                "name": item_name,
+                                "path": item_display_path,
+                                "item_id": item_id,
+                                "item_type": _infer_inventory_item_type(item, item_name)
+                            })
+
+                            if len(devices) >= overall_item_cap:
+                                truncated = True
+                                break
+
+                if is_folder and depth < depth_limit and not truncated:
+                    traverse_folder(
+                        path_key_parts=path_key_parts + [item_name],
+                        path_display_parts=item_display_path,
+                        depth=depth + 1
+                    )
+
+        for root_name in valid_roots:
+            if truncated:
+                break
+
+            root_entry = root_lookup.get(root_name)
+            if not isinstance(root_entry, dict):
+                continue
+
+            root_items, resolved_root_path, root_error = fetch_root_folder(root_entry)
+            if root_error is not None:
+                if root_error == "max_folder_calls":
+                    truncated = True
+                    folders_truncated.append({
+                        "path": [root_name],
+                        "reason": "max_folder_calls"
+                    })
+                    break
+                errors.append({
+                    "path": [root_name],
+                    "error": root_error
+                })
+                continue
+
+            if not isinstance(resolved_root_path, str) or not resolved_root_path.strip():
+                errors.append({
+                    "path": [root_name],
+                    "error": "root_not_resolvable"
+                })
+                continue
+
+            scanned_roots.append(root_name)
+            traverse_folder(
+                path_key_parts=[resolved_root_path],
+                path_display_parts=[root_name],
+                depth=0,
+                prefetched_items=root_items
+            )
+
+        return {
+            "ok": True,
+            "requested_roots": requested_roots,
+            "available_roots": available_roots,
+            "scanned_roots": scanned_roots,
+            "roots_not_found": roots_not_found,
+            "max_depth": depth_limit,
+            "include_presets": bool(include_presets),
+            "truncated": truncated,
+            "folders_truncated": folders_truncated,
+            "devices": devices,
+            "errors": errors
+        }
+    except Exception as e:
+        logger.error(f"Error getting device inventory: {str(e)}")
+        return {
+            "ok": False,
+            "error": "device_inventory_failed",
+            "message": str(e)
+        }
+
+
+@mcp.tool()
+def get_session_snapshot(
+    ctx: Context,
+    track_indices: Optional[List[int]] = None,
+    include_arrangement_clip_sources: bool = True
+) -> Dict[str, Any]:
+    """
+    Return a compact snapshot of session + track state and arrangement clip source paths.
+
+    Parameters:
+    - track_indices: Optional list of track indices. If omitted, includes all normal tracks.
+    - include_arrangement_clip_sources: Include arrangement clip file path details
+    """
+    errors: List[Dict[str, Any]] = []
+
+    try:
+        session_payload, session_error = _coerce_json_dict(get_session_info(ctx))
+        if session_payload is None:
+            try:
+                ableton = get_ableton_connection()
+                direct_session = ableton.send_command("get_session_info")
+                if isinstance(direct_session, dict):
+                    session_payload = direct_session
+            except Exception:
+                pass
+
+        if session_payload is None:
+            return {
+                "ok": False,
+                "error": "session_info_unavailable",
+                "message": session_error or "Failed to retrieve session info"
+            }
+
+        track_count = session_payload.get("track_count")
+
+        if track_indices is None:
+            if not isinstance(track_count, int):
+                return {
+                    "ok": False,
+                    "error": "track_count_missing",
+                    "message": "track_count not available in session info",
+                    "session": session_payload
+                }
+            indices_to_scan = list(range(track_count))
+        else:
+            indices_to_scan = []
+            seen_indices = set()
+            for value in track_indices:
+                try:
+                    track_index = int(value)
+                except Exception:
+                    errors.append({
+                        "track_index": value,
+                        "error": "invalid_track_index_type"
+                    })
+                    continue
+
+                if track_index in seen_indices:
+                    continue
+                seen_indices.add(track_index)
+                indices_to_scan.append(track_index)
+
+        tracks: List[Dict[str, Any]] = []
+        for track_index in indices_to_scan:
+            if isinstance(track_count, int) and (track_index < 0 or track_index >= track_count):
+                errors.append({
+                    "track_index": track_index,
+                    "error": "invalid_track_index"
+                })
+                continue
+
+            track_payload, track_error = _coerce_json_dict(get_track_info(ctx, track_index))
+            if track_payload is None:
+                errors.append({
+                    "track_index": track_index,
+                    "error": "track_info_unavailable",
+                    "message": track_error
+                })
+                continue
+
+            track_entry: Dict[str, Any] = {
+                "track_index": track_index,
+                "track_info": track_payload
+            }
+
+            if include_arrangement_clip_sources:
+                arrangement_payload = list_arrangement_clips(ctx, track_index)
+                if not isinstance(arrangement_payload, dict):
+                    track_entry["arrangement"] = {"supported": False}
+                elif not arrangement_payload.get("supported"):
+                    track_entry["arrangement"] = {
+                        "supported": False,
+                        "reason": arrangement_payload.get("reason")
+                    }
+                else:
+                    clips_out: List[Dict[str, Any]] = []
+                    clips = arrangement_payload.get("clips", [])
+                    if isinstance(clips, list):
+                        for clip in clips:
+                            if not isinstance(clip, dict):
+                                continue
+
+                            clip_index = clip.get("clip_index")
+                            clip_entry: Dict[str, Any] = {
+                                "clip_index": clip_index,
+                                "clip_name": clip.get("clip_name"),
+                                "is_audio_clip": clip.get("is_audio_clip"),
+                                "is_midi_clip": clip.get("is_midi_clip")
+                            }
+
+                            if isinstance(clip_index, int):
+                                source_payload = get_arrangement_clip_source_path(ctx, track_index, clip_index)
+                                if isinstance(source_payload, dict):
+                                    if "file_path" in source_payload:
+                                        clip_entry["file_path"] = source_payload.get("file_path")
+                                    if "exists_on_disk" in source_payload:
+                                        clip_entry["exists_on_disk"] = source_payload.get("exists_on_disk")
+                                    if source_payload.get("error"):
+                                        clip_entry["source_error"] = source_payload.get("error")
+                                else:
+                                    clip_entry["source_error"] = "invalid_source_response"
+                            else:
+                                clip_entry["source_error"] = "invalid_clip_index"
+
+                            clips_out.append(clip_entry)
+
+                    track_entry["arrangement"] = {
+                        "supported": True,
+                        "clip_count": len(clips_out),
+                        "clips": clips_out
+                    }
+
+            tracks.append(track_entry)
+
+        return {
+            "ok": True,
+            "session": session_payload,
+            "tracks": tracks,
+            "errors": errors
+        }
+    except Exception as e:
+        logger.error(f"Error getting session snapshot: {str(e)}")
+        return {
+            "ok": False,
+            "error": "session_snapshot_failed",
+            "message": str(e),
+            "errors": errors
         }
 
 
