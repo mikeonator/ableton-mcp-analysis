@@ -111,6 +111,28 @@ uvx ableton-mcp
 
 ## Usage
 
+### Running from external project folders
+
+If you launch Codex from an Ableton Live Set project folder (instead of this repo), use the repo launcher script with absolute paths so the MCP startup is independent of current working directory.
+
+```json
+{
+    "mcpServers": {
+        "AbletonMCP": {
+            "command": "/Users/mikeonator/Documents/Code/ableton-mcp-analysis/scripts/run_mcp_server.sh",
+            "args": [],
+            "cwd": "/Users/mikeonator/Documents/Code/ableton-mcp-analysis"
+        }
+    }
+}
+```
+
+From any folder you can verify import/tool registration with:
+
+```bash
+/Users/mikeonator/Documents/Code/ableton-mcp-analysis/scripts/mcp_healthcheck.sh
+```
+
 ### Starting the Connection
 
 1. Ensure the Ableton Remote Script is loaded in Ableton Live
