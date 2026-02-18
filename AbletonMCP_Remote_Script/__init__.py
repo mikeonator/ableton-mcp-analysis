@@ -249,11 +249,17 @@ class AbletonMCP(ControlSurface):
                 offset = params.get("offset", 0)
                 limit = params.get("limit", 64)
                 response["result"] = self._get_device_parameters(track_index, device_index, offset, limit)
+            elif command_type == "get_transport_state":
+                response["result"] = self._get_transport_state()
+            elif command_type == "get_tracks_mixer_state":
+                response["result"] = self._get_tracks_mixer_state()
             # Commands that modify Live's state should be scheduled on the main thread
             elif command_type in ["create_midi_track", "set_track_name", 
                                  "create_clip", "add_notes_to_clip", "set_clip_name", 
                                  "set_tempo", "fire_clip", "stop_clip",
-                                 "start_playback", "stop_playback", "load_browser_item"]:
+                                 "start_playback", "stop_playback", "load_browser_item",
+                                 "load_instrument_or_effect",
+                                 "set_transport_state", "set_tracks_mixer_state"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -306,6 +312,13 @@ class AbletonMCP(ControlSurface):
                             track_index = params.get("track_index", 0)
                             item_uri = params.get("item_uri", "")
                             result = self._load_browser_item(track_index, item_uri)
+                        elif command_type == "set_transport_state":
+                            song_time_sec = params.get("song_time_sec", None)
+                            is_playing = params.get("is_playing", None)
+                            result = self._set_transport_state(song_time_sec, is_playing)
+                        elif command_type == "set_tracks_mixer_state":
+                            states = params.get("states", [])
+                            result = self._set_tracks_mixer_state(states)
                         
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
@@ -372,6 +385,8 @@ class AbletonMCP(ControlSurface):
                 "signature_denominator": self._song.signature_denominator,
                 "track_count": len(self._song.tracks),
                 "return_track_count": len(self._song.return_tracks),
+                "is_playing": bool(self._song.is_playing),
+                "current_song_time": float(self._song.current_song_time),
                 "master_track": {
                     "name": "Master",
                     "volume": self._song.master_track.mixer_device.volume.value,
@@ -422,6 +437,10 @@ class AbletonMCP(ControlSurface):
 
             # Some track-like objects can raise on state access (for example arm on non-armable tracks).
             # Keep fields stable but nullable when Live does not expose the property safely.
+            is_group_track, track_kind = self._infer_track_kind(track)
+            has_audio_input = self._safe_track_state(track, "has_audio_input")
+            has_midi_input = self._safe_track_state(track, "has_midi_input")
+            group_track_index = self._resolve_group_track_index(self._song, track)
             mute = self._safe_track_state(track, "mute")
             solo = self._safe_track_state(track, "solo")
             arm = self._safe_track_state(track, "arm")
@@ -433,8 +452,11 @@ class AbletonMCP(ControlSurface):
             result = {
                 "index": track_index,
                 "name": track.name,
-                "is_audio_track": self._safe_track_state(track, "has_audio_input"),
-                "is_midi_track": self._safe_track_state(track, "has_midi_input"),
+                "is_group_track": is_group_track,
+                "track_kind": track_kind,
+                "group_track_index": group_track_index,
+                "is_audio_track": has_audio_input,
+                "is_midi_track": has_midi_input,
                 "mute": mute,
                 "solo": solo,
                 "arm": arm,
@@ -509,7 +531,10 @@ class AbletonMCP(ControlSurface):
             "clip_index": clip_index,
             "clip_name": None,
             "is_audio_clip": None,
-            "is_midi_clip": None
+            "is_midi_clip": None,
+            "start_time_beats": None,
+            "end_time_beats": None,
+            "length_beats": None
         }
 
         try:
@@ -528,6 +553,34 @@ class AbletonMCP(ControlSurface):
                 metadata["is_midi_clip"] = bool(getattr(clip, "is_midi_clip"))
         except Exception:
             pass
+
+        try:
+            start_value = self._json_scalar(self._safe_attr(clip, "start_time"))
+            if isinstance(start_value, (int, float)):
+                metadata["start_time_beats"] = float(start_value)
+        except Exception:
+            pass
+
+        try:
+            end_value = self._json_scalar(self._safe_attr(clip, "end_time"))
+            if isinstance(end_value, (int, float)):
+                metadata["end_time_beats"] = float(end_value)
+        except Exception:
+            pass
+
+        try:
+            length_value = self._json_scalar(self._safe_attr(clip, "length"))
+            if isinstance(length_value, (int, float)):
+                metadata["length_beats"] = float(length_value)
+        except Exception:
+            pass
+
+        if (
+            isinstance(metadata.get("start_time_beats"), (int, float))
+            and isinstance(metadata.get("length_beats"), (int, float))
+            and not isinstance(metadata.get("end_time_beats"), (int, float))
+        ):
+            metadata["end_time_beats"] = float(metadata["start_time_beats"]) + float(metadata["length_beats"])
 
         return metadata
 
@@ -757,6 +810,237 @@ class AbletonMCP(ControlSurface):
             return bool(value)
         except Exception:
             return None
+
+    def _infer_track_kind(self, track):
+        """Classify the track as group/audio/midi/hybrid/unknown."""
+        is_group_track = self._safe_track_state(track, "is_foldable")
+        has_audio_input = self._safe_track_state(track, "has_audio_input")
+        has_midi_input = self._safe_track_state(track, "has_midi_input")
+
+        if is_group_track:
+            return True, "group"
+        if has_audio_input and has_midi_input:
+            return False, "hybrid"
+        if has_audio_input:
+            return False, "audio"
+        if has_midi_input:
+            return False, "midi"
+        return False, "unknown"
+
+    def _resolve_group_track_index(self, song, track):
+        """Return parent group track index for a grouped track, else None."""
+        if song is None or track is None:
+            return None
+
+        group_track = self._safe_attr(track, "group_track")
+        if group_track is None:
+            return None
+
+        tracks = self._to_list(self._safe_attr(song, "tracks"))
+        if not isinstance(tracks, list):
+            return None
+
+        for index, candidate in enumerate(tracks):
+            try:
+                if candidate is group_track or candidate == group_track:
+                    return int(index)
+            except Exception:
+                continue
+        return None
+
+    def _set_track_state_bool(self, track, attr_name, value):
+        """Best-effort track bool-state write for fields like mute/solo."""
+        if track is None or not isinstance(attr_name, string_types):
+            return False
+        if not hasattr(track, attr_name):
+            return False
+        try:
+            setattr(track, attr_name, bool(value))
+            return True
+        except Exception:
+            return False
+
+    def _get_transport_state(self):
+        """Return transport playback and song-time state."""
+        song = self._get_song()
+        if song is None:
+            return {
+                "ok": False,
+                "error": "song_unavailable",
+                "message": "Could not access song"
+            }
+
+        return {
+            "ok": True,
+            "is_playing": bool(self._safe_attr(song, "is_playing")),
+            "song_time_sec": float(self._safe_attr(song, "current_song_time") or 0.0)
+        }
+
+    def _set_transport_state(self, song_time_sec=None, is_playing=None):
+        """Set transport song time and playback state."""
+        song = self._get_song()
+        if song is None:
+            return {
+                "ok": False,
+                "error": "song_unavailable",
+                "message": "Could not access song"
+            }
+
+        try:
+            if song_time_sec is not None:
+                song.current_song_time = max(0.0, float(song_time_sec))
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": "invalid_song_time",
+                "message": str(e)
+            }
+
+        if is_playing is not None:
+            try:
+                if bool(is_playing):
+                    song.start_playing()
+                else:
+                    song.stop_playing()
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "error": "set_playback_failed",
+                    "message": str(e)
+                }
+
+        transport_state = self._get_transport_state()
+        if not isinstance(transport_state, dict):
+            transport_state = {}
+        transport_state["ok"] = True
+        return transport_state
+
+    def _get_tracks_mixer_state(self):
+        """Return track solo/mute state snapshot for all normal tracks."""
+        song = self._get_song()
+        if song is None:
+            return {
+                "ok": False,
+                "error": "song_unavailable",
+                "message": "Could not access song"
+            }
+
+        states = []
+        for track_index, track in enumerate(song.tracks):
+            track_name = self._safe_attr(track, "name")
+            if track_name is not None and not isinstance(track_name, string_types):
+                try:
+                    track_name = str(track_name)
+                except Exception:
+                    track_name = None
+            is_group_track, track_kind = self._infer_track_kind(track)
+            group_track_index = self._resolve_group_track_index(song, track)
+
+            states.append({
+                "track_index": int(track_index),
+                "track_name": track_name,
+                "is_group_track": is_group_track,
+                "track_kind": track_kind,
+                "group_track_index": group_track_index,
+                "solo": self._safe_track_state(track, "solo"),
+                "mute": self._safe_track_state(track, "mute")
+            })
+
+        return {
+            "ok": True,
+            "track_count": len(states),
+            "states": states
+        }
+
+    def _set_tracks_mixer_state(self, states):
+        """Apply solo/mute updates to multiple tracks in one main-thread operation."""
+        song = self._get_song()
+        if song is None:
+            return {
+                "ok": False,
+                "error": "song_unavailable",
+                "message": "Could not access song",
+                "updated_count": 0,
+                "errors": [{"error": "song_unavailable"}]
+            }
+
+        if not isinstance(states, list):
+            return {
+                "ok": False,
+                "error": "invalid_states",
+                "message": "states must be a list",
+                "updated_count": 0,
+                "errors": [{"error": "states_not_list"}]
+            }
+
+        updated = []
+        errors = []
+        for entry in states:
+            if not isinstance(entry, dict):
+                errors.append({"error": "invalid_entry_type"})
+                continue
+
+            track_index = entry.get("track_index")
+            try:
+                track_index = int(track_index)
+            except Exception:
+                errors.append({
+                    "error": "invalid_track_index",
+                    "track_index": track_index
+                })
+                continue
+
+            if track_index < 0 or track_index >= len(song.tracks):
+                errors.append({
+                    "error": "track_index_out_of_range",
+                    "track_index": track_index
+                })
+                continue
+
+            track = song.tracks[track_index]
+            track_update = {"track_index": track_index}
+
+            if "solo" in entry:
+                desired_solo = entry.get("solo")
+                if isinstance(desired_solo, bool):
+                    if self._set_track_state_bool(track, "solo", desired_solo):
+                        track_update["solo"] = bool(desired_solo)
+                    else:
+                        errors.append({
+                            "error": "set_solo_failed",
+                            "track_index": track_index
+                        })
+                elif desired_solo is not None:
+                    errors.append({
+                        "error": "invalid_solo_value",
+                        "track_index": track_index
+                    })
+
+            if "mute" in entry:
+                desired_mute = entry.get("mute")
+                if isinstance(desired_mute, bool):
+                    if self._set_track_state_bool(track, "mute", desired_mute):
+                        track_update["mute"] = bool(desired_mute)
+                    else:
+                        errors.append({
+                            "error": "set_mute_failed",
+                            "track_index": track_index
+                        })
+                elif desired_mute is not None:
+                    errors.append({
+                        "error": "invalid_mute_value",
+                        "track_index": track_index
+                    })
+
+            if len(track_update) > 1:
+                updated.append(track_update)
+
+        return {
+            "ok": True,
+            "updated_count": len(updated),
+            "updated": updated,
+            "errors": errors
+        }
 
     def _resolve_track_by_index(self, track_index):
         """Resolve and validate a track by index."""

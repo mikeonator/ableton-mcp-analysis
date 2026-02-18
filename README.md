@@ -133,6 +133,31 @@ From any folder you can verify import/tool registration with:
 /Users/mikeonator/Documents/Code/ableton-mcp-analysis/scripts/mcp_healthcheck.sh
 ```
 
+### Export-based ears (no loopback)
+
+This repo supports a file-based analysis workflow for reliable signal awareness without BlackHole/loopback routing:
+
+1. `plan_exports` to create a manifest and deterministic output paths.
+2. Export WAVs in Ableton to the suggested paths.
+3. `check_exports_ready` and wait until `ready=true`.
+4. `analyze_export_job` for full job analysis, or `analyze_audio_file` for direct single-file analysis.
+
+`analyze_audio_file` supports `.wav` natively and `.mp3`, `.aif/.aiff`, `.flac` (plus `.m4a` where available)
+by decoding non-WAV inputs to `AbletonMCP/analysis/tmp_decoded/` with `ffmpeg`.
+
+Mandatory protocol for model agents:
+- If audio analysis is requested and no `wav_path` is available, agents must use:
+  `plan_exports -> check_exports_ready -> (wait if WAIT_FOR_USER_EXPORT) -> analyze_export_job`
+
+Default folders (project mode):
+- Exports: `<project>/AbletonMCP/exports`
+- Analysis + manifests: `<project>/AbletonMCP/analysis`
+
+Recommended Ableton export settings:
+- WAV (PCM), 24-bit
+- Normalize OFF
+- Sample rate matches project
+
 ### Starting the Connection
 
 1. Ensure the Ableton Remote Script is loaded in Ableton Live
