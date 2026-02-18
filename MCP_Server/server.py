@@ -6,10 +6,21 @@ import logging
 import os
 import hashlib
 import math
+import re
+import shutil
+import subprocess
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List, Union, Optional, Tuple
+from MCP_Server.audio_analysis import analyze_wav_file, AudioAnalysisError
+from MCP_Server.pathing import (
+    get_export_dir,
+    get_analysis_dir,
+    ensure_dirs_exist,
+    bootstrap_project_environment,
+    resolve_pathing,
+)
 
 try:
     import numpy as np
@@ -134,7 +145,8 @@ class AbletonConnection:
             "create_midi_track", "create_audio_track", "set_track_name",
             "create_clip", "add_notes_to_clip", "set_clip_name",
             "set_tempo", "fire_clip", "stop_clip", "set_device_parameter",
-            "start_playback", "stop_playback", "load_instrument_or_effect"
+            "start_playback", "stop_playback", "load_instrument_or_effect",
+            "set_transport_state", "set_tracks_mixer_state"
         ]
         
         try:
@@ -195,6 +207,14 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
     """Manage server startup and shutdown lifecycle"""
     try:
         logger.info("AbletonMCP server starting up")
+        try:
+            bootstrap_result = bootstrap_project_environment()
+            warnings = bootstrap_result.get("warnings", [])
+            if isinstance(warnings, list) and warnings:
+                for warning in warnings:
+                    logger.warning(f"Pathing bootstrap warning: {warning}")
+        except Exception as bootstrap_exc:
+            logger.warning(f"Pathing bootstrap failed: {str(bootstrap_exc)}")
         
         try:
             ableton = get_ableton_connection()
@@ -225,12 +245,16 @@ _SOURCE_CACHE_VERSION = 2
 _SOURCE_CACHE_DIR = os.path.expanduser("~/.ableton_mcp_analysis/cache")
 _LAUNCH_CWD = os.path.abspath(os.environ.get("ABLETON_MCP_LAUNCH_CWD", os.getcwd()))
 _SUPPORTED_AUDIO_EXTENSIONS = {".wav", ".aiff", ".aif", ".mp3", ".m4a", ".flac"}
+_ANALYZE_AUDIO_INPUT_FORMATS = {"wav", "mp3", "aif", "aiff", "flac", "m4a"}
 _DEVICE_CAPABILITIES_SCHEMA_VERSION = 1
 _DEVICE_CAPABILITIES_CACHE_PATH = os.path.join(_SOURCE_CACHE_DIR, "device_capabilities.json")
 _DEVICE_INVENTORY_CACHE_SCHEMA_VERSION = 1
 _DEVICE_INVENTORY_CACHE_PATH = os.path.join(_SOURCE_CACHE_DIR, "device_inventory_cache.json")
 _PROJECT_SNAPSHOT_SCHEMA_VERSION = 1
 _PROJECT_SNAPSHOT_DIR = os.path.join(_SOURCE_CACHE_DIR, "project_snapshots")
+_AUDIO_ANALYSIS_CACHE_VERSION = 2
+_DEFAULT_AUDIO_WINDOW_SEC = 1.0
+_DEFAULT_RMS_THRESHOLD_DBFS = -60.0
 _DEVICE_CAPABILITY_BUCKETS = [
     "eq",
     "compression",
@@ -377,6 +401,15 @@ class SourceAnalysisError(Exception):
         self.message = message
 
 
+class LiveCaptureError(Exception):
+    """Structured error used by range/analysis helper utilities."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 def _utc_now_iso() -> str:
     """Return UTC timestamp in ISO8601 format."""
     return datetime.now(timezone.utc).isoformat()
@@ -393,6 +426,158 @@ def _normalize_source_path(file_path: str) -> str:
 def _ensure_cache_dir() -> None:
     """Ensure source analysis cache directory exists."""
     os.makedirs(_SOURCE_CACHE_DIR, exist_ok=True)
+
+
+def _ensure_audio_analysis_cache_dir() -> None:
+    """Ensure audio analysis cache directory exists."""
+    os.makedirs(get_analysis_dir(), exist_ok=True)
+
+
+def _sanitize_filename_token(value: str, fallback: str = "section") -> str:
+    """Sanitize text for filesystem-safe filename tokens."""
+    if not isinstance(value, str):
+        return fallback
+    token = re.sub(r"[^a-zA-Z0-9._-]+", "_", value.strip())
+    token = token.strip("._-")
+    if not token:
+        return fallback
+    return token[:120]
+
+
+def _audio_analysis_cache_key(payload: Dict[str, Any]) -> str:
+    """Build stable cache key for audio analysis inputs."""
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _audio_analysis_cache_path(cache_key: str) -> str:
+    """Return cache file path for audio analysis key."""
+    return os.path.join(get_analysis_dir(), f"{cache_key}.json")
+
+
+def _load_audio_analysis_cache(cache_path: str) -> Optional[Dict[str, Any]]:
+    """Load audio analysis cache payload when available."""
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        with open(cache_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        return None
+    return None
+
+
+def _write_audio_analysis_cache(cache_path: str, payload: Dict[str, Any]) -> None:
+    """Persist audio analysis cache payload."""
+    _ensure_audio_analysis_cache_dir()
+    with open(cache_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+
+
+def _audio_input_format(file_path: str) -> str:
+    """Return normalized input format token (without leading dot)."""
+    extension = os.path.splitext(file_path)[1].strip().lower()
+    if extension.startswith("."):
+        extension = extension[1:]
+    return extension
+
+
+def _decoded_audio_tmp_dir() -> str:
+    """Return directory used for decoded non-wav analysis artifacts."""
+    return os.path.join(get_analysis_dir(), "tmp_decoded")
+
+
+def _ensure_decoded_audio_tmp_dir() -> str:
+    """Ensure decoded non-wav cache directory exists and return path."""
+    decoded_dir = _decoded_audio_tmp_dir()
+    os.makedirs(decoded_dir, exist_ok=True)
+    return decoded_dir
+
+
+def _decoded_wav_cache_path(
+    source_path: str,
+    stat_size: int,
+    stat_mtime: float
+) -> str:
+    """Build deterministic decoded WAV cache path from source metadata."""
+    cache_input = f"{source_path}|{int(stat_size)}|{float(stat_mtime):.6f}"
+    cache_key = hashlib.sha256(cache_input.encode("utf-8")).hexdigest()
+    return os.path.join(_ensure_decoded_audio_tmp_dir(), f"{cache_key}.wav")
+
+
+def _decode_source_to_wav(
+    source_path: str,
+    input_format: str,
+    stat_size: int,
+    stat_mtime: float
+) -> Tuple[str, Optional[str]]:
+    """Return analysis WAV path, decoding source with ffmpeg when needed."""
+    if input_format == "wav":
+        return source_path, None
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        raise LiveCaptureError(
+            "FFMPEG_NOT_FOUND",
+            "ffmpeg required to analyze mp3/aif/flac."
+        )
+
+    decoded_wav_path = _decoded_wav_cache_path(
+        source_path=source_path,
+        stat_size=int(stat_size),
+        stat_mtime=float(stat_mtime)
+    )
+
+    decoded_exists, decoded_size, _ = _safe_file_stats(decoded_wav_path)
+    if (
+        decoded_exists
+        and isinstance(decoded_size, int)
+        and decoded_size > 44
+        and _check_wav_header(decoded_wav_path)
+    ):
+        return decoded_wav_path, decoded_wav_path
+
+    cmd = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        source_path,
+        "-vn",
+        "-acodec",
+        "pcm_s16le",
+        decoded_wav_path,
+    ]
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120.0
+        )
+    except subprocess.TimeoutExpired:
+        raise LiveCaptureError("decode_timeout", "ffmpeg decode timed out")
+    except Exception as exc:
+        raise LiveCaptureError("decode_failed", f"ffmpeg decode failed: {str(exc)}")
+
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        if not stderr:
+            stderr = "Unknown ffmpeg decode failure"
+        raise LiveCaptureError("decode_failed", stderr)
+
+    decoded_exists, decoded_size, _ = _safe_file_stats(decoded_wav_path)
+    if not decoded_exists or not isinstance(decoded_size, int) or decoded_size <= 44:
+        raise LiveCaptureError("decode_failed", "Decoded WAV is empty or invalid")
+    if not _check_wav_header(decoded_wav_path):
+        raise LiveCaptureError("decode_failed", "Decoded WAV header validation failed")
+
+    return decoded_wav_path, decoded_wav_path
 
 
 def _source_cache_path(file_path: str) -> str:
@@ -1323,6 +1508,565 @@ def _analyze_audio_source(file_path: str, stat_size: int, stat_mtime: float) -> 
         "summary": summary,
         "analysis_notes": analysis_notes
     }
+
+
+def _beats_per_bar(signature_numerator: int, signature_denominator: int) -> float:
+    """Convert time signature into beats per bar."""
+    if signature_numerator <= 0 or signature_denominator <= 0:
+        raise LiveCaptureError("invalid_time_signature", "Session time signature is invalid")
+    return float(signature_numerator) * (4.0 / float(signature_denominator))
+
+
+def _bars_to_seconds(
+    bar_number: int,
+    tempo: float,
+    signature_numerator: int,
+    signature_denominator: int
+) -> float:
+    """Convert 1-based bar position to absolute seconds from project start."""
+    if bar_number < 1:
+        raise LiveCaptureError("invalid_bar", "Bar numbers must be >= 1")
+    if tempo <= 0:
+        raise LiveCaptureError("invalid_tempo", "Session tempo must be > 0")
+
+    beats_per_bar = _beats_per_bar(signature_numerator, signature_denominator)
+    beats_from_start = (float(bar_number) - 1.0) * beats_per_bar
+    return max(0.0, beats_from_start * (60.0 / tempo))
+
+
+def _resolve_capture_range_seconds(
+    session_payload: Dict[str, Any],
+    start_bar: Optional[int],
+    end_bar: Optional[int],
+    start_time_sec: Optional[float],
+    duration_sec: Optional[float],
+    max_duration_sec: Optional[float] = None
+) -> Dict[str, Any]:
+    """Resolve mixed bar/time inputs into a validated [start, end, duration] section."""
+    try:
+        tempo = float(session_payload.get("tempo"))
+    except Exception:
+        raise LiveCaptureError("invalid_session_info", "tempo missing or invalid in session info")
+    if tempo <= 0.0:
+        raise LiveCaptureError("invalid_session_info", "tempo must be > 0")
+
+    try:
+        signature_numerator = int(session_payload.get("signature_numerator"))
+        signature_denominator = int(session_payload.get("signature_denominator"))
+    except Exception:
+        raise LiveCaptureError("invalid_session_info", "time signature missing or invalid in session info")
+
+    beats_per_bar = _beats_per_bar(signature_numerator, signature_denominator)
+
+    if start_time_sec is not None:
+        try:
+            start_sec = float(start_time_sec)
+        except Exception:
+            raise LiveCaptureError("invalid_start_time_sec", "start_time_sec must be numeric")
+        if start_sec < 0.0:
+            raise LiveCaptureError("invalid_start_time_sec", "start_time_sec must be >= 0")
+        resolved_start_bar = None
+    else:
+        if start_bar is None:
+            start_bar = 1
+        try:
+            start_bar_value = int(start_bar)
+        except Exception:
+            raise LiveCaptureError("invalid_start_bar", "start_bar must be an integer")
+        start_sec = _bars_to_seconds(
+            bar_number=start_bar_value,
+            tempo=tempo,
+            signature_numerator=signature_numerator,
+            signature_denominator=signature_denominator
+        )
+        resolved_start_bar = start_bar_value
+
+    end_sec_from_bar: Optional[float] = None
+    resolved_end_bar: Optional[int] = None
+    if end_bar is not None:
+        try:
+            end_bar_value = int(end_bar)
+        except Exception:
+            raise LiveCaptureError("invalid_end_bar", "end_bar must be an integer")
+        end_sec_from_bar = _bars_to_seconds(
+            bar_number=end_bar_value,
+            tempo=tempo,
+            signature_numerator=signature_numerator,
+            signature_denominator=signature_denominator
+        )
+        resolved_end_bar = end_bar_value
+
+    if duration_sec is not None:
+        try:
+            resolved_duration_sec = float(duration_sec)
+        except Exception:
+            raise LiveCaptureError("invalid_duration_sec", "duration_sec must be numeric")
+        if resolved_duration_sec <= 0.0:
+            raise LiveCaptureError("invalid_duration_sec", "duration_sec must be > 0")
+        end_sec = start_sec + resolved_duration_sec
+    elif end_sec_from_bar is not None:
+        resolved_duration_sec = end_sec_from_bar - start_sec
+        if resolved_duration_sec <= 0.0:
+            raise LiveCaptureError(
+                "invalid_range",
+                "Resolved end time must be greater than start time"
+            )
+        end_sec = end_sec_from_bar
+    else:
+        raise LiveCaptureError(
+            "missing_range",
+            "Provide duration_sec, or provide end_bar, to define capture length"
+        )
+
+    if max_duration_sec is not None and resolved_duration_sec > float(max_duration_sec):
+        raise LiveCaptureError(
+            "duration_too_long",
+            f"Requested duration {resolved_duration_sec:.3f}s exceeds max {float(max_duration_sec):.1f}s"
+        )
+
+    return {
+        "start_sec": float(start_sec),
+        "end_sec": float(end_sec),
+        "duration_sec": float(resolved_duration_sec),
+        "tempo": float(tempo),
+        "signature_numerator": int(signature_numerator),
+        "signature_denominator": int(signature_denominator),
+        "beats_per_bar": float(beats_per_bar),
+        "start_bar": resolved_start_bar,
+        "end_bar": resolved_end_bar
+    }
+
+
+def _extract_track_kind(track_payload: Dict[str, Any]) -> str:
+    """Resolve track kind field with backwards-compatible fallbacks."""
+    if not isinstance(track_payload, dict):
+        return "unknown"
+    kind_value = track_payload.get("track_kind")
+    if isinstance(kind_value, str) and kind_value.strip():
+        return kind_value.strip().lower()
+
+    if bool(track_payload.get("is_group_track")):
+        return "group"
+    if bool(track_payload.get("is_audio_track")) and bool(track_payload.get("is_midi_track")):
+        return "hybrid"
+    if bool(track_payload.get("is_audio_track")):
+        return "audio"
+    if bool(track_payload.get("is_midi_track")):
+        return "midi"
+    return "unknown"
+
+
+def _normalize_arrangement_target(target: str, track_index: Optional[int]) -> Dict[str, Any]:
+    """Validate arrangement target selector."""
+    target_value = target.strip().lower() if isinstance(target, str) else ""
+    if target_value not in {"track", "group", "mix"}:
+        raise LiveCaptureError("invalid_target", "target must be 'track', 'group', or 'mix'")
+
+    if target_value in {"track", "group"}:
+        if track_index is None:
+            raise LiveCaptureError("missing_track_index", "track_index is required for target='track'/'group'")
+        try:
+            normalized_index = int(track_index)
+        except Exception:
+            raise LiveCaptureError("invalid_track_index", "track_index must be an integer")
+        if normalized_index < 0:
+            raise LiveCaptureError("invalid_track_index", "track_index must be >= 0")
+        return {"target": target_value, "track_index": normalized_index}
+
+    return {"target": "mix", "track_index": None}
+
+
+def _get_tracks_mixer_state_rows(ableton: AbletonConnection) -> List[Dict[str, Any]]:
+    """Return normalized track mixer/state rows including grouping metadata."""
+    try:
+        payload = ableton.send_command("get_tracks_mixer_state")
+        raw_states = payload.get("states", []) if isinstance(payload, dict) else []
+    except Exception:
+        raw_states = []
+
+    rows: List[Dict[str, Any]] = []
+    if isinstance(raw_states, list):
+        for row in raw_states:
+            if not isinstance(row, dict):
+                continue
+            try:
+                track_index = int(row.get("track_index"))
+            except Exception:
+                continue
+            group_track_index_raw = row.get("group_track_index")
+            group_track_index = None
+            if group_track_index_raw is not None:
+                try:
+                    group_track_index = int(group_track_index_raw)
+                except Exception:
+                    group_track_index = None
+
+            rows.append({
+                "track_index": track_index,
+                "track_name": row.get("track_name"),
+                "track_kind": _extract_track_kind(row),
+                "is_group_track": bool(row.get("is_group_track")),
+                "group_track_index": group_track_index
+            })
+    if rows:
+        rows.sort(key=lambda item: item["track_index"])
+        return rows
+
+    # Fallback path for older backends.
+    session = ableton.send_command("get_session_info")
+    track_count = int(session.get("track_count", 0)) if isinstance(session, dict) else 0
+    for track_index in range(max(0, track_count)):
+        try:
+            track_info = ableton.send_command("get_track_info", {"track_index": track_index})
+        except Exception:
+            continue
+        if not isinstance(track_info, dict):
+            continue
+
+        group_track_index_raw = track_info.get("group_track_index")
+        group_track_index = None
+        if group_track_index_raw is not None:
+            try:
+                group_track_index = int(group_track_index_raw)
+            except Exception:
+                group_track_index = None
+
+        rows.append({
+            "track_index": track_index,
+            "track_name": track_info.get("name"),
+            "track_kind": _extract_track_kind(track_info),
+            "is_group_track": bool(track_info.get("is_group_track")),
+            "group_track_index": group_track_index
+        })
+    rows.sort(key=lambda item: item["track_index"])
+    return rows
+
+
+def _collect_group_tree_indices(
+    track_rows: List[Dict[str, Any]],
+    group_track_index: int,
+    include_children: bool
+) -> List[int]:
+    """Return group track index + optional recursive child indices."""
+    known_indices = {int(row["track_index"]) for row in track_rows if isinstance(row, dict) and "track_index" in row}
+    if group_track_index not in known_indices:
+        raise LiveCaptureError("invalid_track_index", f"track_index {group_track_index} out of range")
+
+    if not include_children:
+        return [group_track_index]
+
+    remaining = [group_track_index]
+    seen = {group_track_index}
+    result = [group_track_index]
+    while remaining:
+        current = remaining.pop(0)
+        for row in track_rows:
+            if not isinstance(row, dict):
+                continue
+            parent = row.get("group_track_index")
+            if parent != current:
+                continue
+            child_index = row.get("track_index")
+            if not isinstance(child_index, int):
+                continue
+            if child_index in seen:
+                continue
+            seen.add(child_index)
+            result.append(child_index)
+            if row.get("track_kind") == "group":
+                remaining.append(child_index)
+    result.sort()
+    return result
+
+
+def _clip_interval_from_metadata(clip_payload: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    """Extract [start_beat, end_beat] interval from arrangement clip metadata."""
+    if not isinstance(clip_payload, dict):
+        return None
+
+    def _as_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            parsed = float(value)
+        except Exception:
+            return None
+        if not math.isfinite(parsed):
+            return None
+        return parsed
+
+    start_beat = None
+    for key in ("start_time_beats", "start_time", "clip_start_beats"):
+        start_beat = _as_float(clip_payload.get(key))
+        if start_beat is not None:
+            break
+
+    end_beat = None
+    for key in ("end_time_beats", "end_time", "clip_end_beats"):
+        end_beat = _as_float(clip_payload.get(key))
+        if end_beat is not None:
+            break
+
+    length_beat = None
+    for key in ("length_beats", "length", "duration_beats"):
+        length_beat = _as_float(clip_payload.get(key))
+        if length_beat is not None:
+            break
+
+    if start_beat is None:
+        return None
+    if end_beat is None and length_beat is not None:
+        end_beat = float(start_beat) + float(length_beat)
+    if end_beat is None:
+        return None
+    if end_beat <= start_beat:
+        return None
+    return float(start_beat), float(end_beat)
+
+
+def _collect_arrangement_intervals_for_tracks(
+    ctx: Context,
+    track_indices: List[int]
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Collect arrangement clip intervals for the requested tracks."""
+    intervals: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+    for track_index in track_indices:
+        payload = list_arrangement_clips(ctx, track_index)
+        if not isinstance(payload, dict):
+            warnings.append(f"track_{track_index}:invalid_arrangement_response")
+            continue
+        if not payload.get("supported"):
+            warnings.append(f"track_{track_index}:arrangement_not_supported")
+            continue
+        clips = payload.get("clips", [])
+        if not isinstance(clips, list):
+            warnings.append(f"track_{track_index}:invalid_clip_list")
+            continue
+        for clip in clips:
+            interval = _clip_interval_from_metadata(clip if isinstance(clip, dict) else {})
+            if interval is None:
+                continue
+            start_beat, end_beat = interval
+            intervals.append({
+                "track_index": int(track_index),
+                "clip_index": clip.get("clip_index") if isinstance(clip, dict) else None,
+                "start_beat": start_beat,
+                "end_beat": end_beat
+            })
+    return intervals, warnings
+
+
+def _build_activity_timeline(
+    intervals: List[Dict[str, Any]],
+    beats_per_bar: float,
+    start_bar: int,
+    end_bar: int,
+    bar_resolution: int
+) -> Dict[str, Any]:
+    """Build coarse per-bar activity flags from beat intervals."""
+    if start_bar < 1:
+        raise LiveCaptureError("invalid_start_bar", "start_bar must be >= 1")
+    if end_bar < start_bar:
+        raise LiveCaptureError("invalid_range", "end_bar must be >= start_bar")
+    if bar_resolution <= 0:
+        raise LiveCaptureError("invalid_bar_resolution", "bar_resolution must be > 0")
+
+    bars: List[Dict[str, Any]] = []
+    first_active_bar: Optional[int] = None
+    active_bar_count = 0
+
+    normalized_intervals: List[Tuple[float, float]] = []
+    for row in intervals:
+        if not isinstance(row, dict):
+            continue
+        try:
+            start_beat = float(row.get("start_beat"))
+            end_beat = float(row.get("end_beat"))
+        except Exception:
+            continue
+        if end_beat <= start_beat:
+            continue
+        normalized_intervals.append((start_beat, end_beat))
+
+    for bar in range(start_bar, end_bar + 1, bar_resolution):
+        segment_start_beat = (float(bar) - 1.0) * beats_per_bar
+        segment_end_bar = min(end_bar + 1, bar + bar_resolution)
+        segment_end_beat = (float(segment_end_bar) - 1.0) * beats_per_bar
+
+        has_clip = False
+        for clip_start_beat, clip_end_beat in normalized_intervals:
+            if clip_start_beat < segment_end_beat and clip_end_beat > segment_start_beat:
+                has_clip = True
+                break
+
+        if has_clip and first_active_bar is None:
+            first_active_bar = int(bar)
+        if has_clip:
+            active_bar_count += 1
+
+        bars.append({
+            "bar": int(bar),
+            "has_clip": bool(has_clip)
+        })
+
+    return {
+        "bars": bars,
+        "first_active_bar": first_active_bar,
+        "active_bar_count": active_bar_count,
+        "detected_activity": first_active_bar is not None
+    }
+
+
+def _suggest_export_filename(
+    target: str,
+    track_index: Optional[int],
+    suggest_filename: Optional[str],
+    start_sec: float,
+    end_sec: float
+) -> str:
+    """Build stable recommended filename for manual Ableton exports."""
+    if isinstance(suggest_filename, str) and suggest_filename.strip():
+        base = _sanitize_filename_token(suggest_filename, fallback="export_section")
+    else:
+        target_token = target if target != "track" else f"track_{track_index}"
+        start_token = f"{int(round(start_sec * 1000.0))}ms"
+        end_token = f"{int(round(end_sec * 1000.0))}ms"
+        base = _sanitize_filename_token(f"{target_token}_{start_token}_{end_token}", fallback="export_section")
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{timestamp}_{base}.wav"
+
+
+def _format_clock(seconds: float) -> str:
+    """Format seconds as HH:MM:SS.mmm string."""
+    total_ms = max(0, int(round(float(seconds) * 1000.0)))
+    hours, rem = divmod(total_ms, 3600 * 1000)
+    minutes, rem = divmod(rem, 60 * 1000)
+    secs, millis = divmod(rem, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
+
+
+def _seconds_to_bar_number(seconds: float, tempo: float, beats_per_bar: float) -> int:
+    """Convert absolute seconds to 1-based bar number."""
+    if tempo <= 0.0 or beats_per_bar <= 0.0:
+        return 1
+    beats = max(0.0, float(seconds)) * (float(tempo) / 60.0)
+    return int(math.floor(beats / beats_per_bar)) + 1
+
+
+def _default_wav_settings() -> Dict[str, Any]:
+    """Return default export WAV settings."""
+    return {
+        "bit_depth": 24,
+        "sample_rate": "project",
+        "normalize": False,
+        "dither": False
+    }
+
+
+def _normalize_wav_settings(wav_settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Normalize and validate plan-export WAV settings."""
+    defaults = _default_wav_settings()
+    if not isinstance(wav_settings, dict):
+        return defaults
+
+    normalized = dict(defaults)
+    bit_depth_value = wav_settings.get("bit_depth", defaults["bit_depth"])
+    if bit_depth_value in {24, 32}:
+        normalized["bit_depth"] = bit_depth_value
+
+    sample_rate_value = wav_settings.get("sample_rate", defaults["sample_rate"])
+    if sample_rate_value in {44100, 48000, 96000, "project"}:
+        normalized["sample_rate"] = sample_rate_value
+
+    normalized["normalize"] = bool(wav_settings.get("normalize", defaults["normalize"]))
+    normalized["dither"] = bool(wav_settings.get("dither", defaults["dither"]))
+    return normalized
+
+
+def _export_manifest_filename(job_name: str) -> str:
+    """Return stable manifest filename for export jobs."""
+    job_token = _sanitize_filename_token(job_name, fallback="export_job")
+    return f"{job_token}__export_manifest.json"
+
+
+def _resolve_export_manifest_path(
+    manifest_path: Optional[str],
+    job_name: Optional[str]
+) -> str:
+    """Resolve export manifest path from explicit path or job name."""
+    if isinstance(manifest_path, str) and manifest_path.strip():
+        return _normalize_source_path(manifest_path.strip())
+    if isinstance(job_name, str) and job_name.strip():
+        return os.path.join(get_analysis_dir(), _export_manifest_filename(job_name.strip()))
+    raise LiveCaptureError("missing_manifest_reference", "Provide manifest_path or job_name")
+
+
+def _load_export_manifest(path: str) -> Dict[str, Any]:
+    """Load and validate export manifest JSON."""
+    normalized = _normalize_source_path(path)
+    if not os.path.exists(normalized):
+        raise LiveCaptureError("manifest_not_found", f"Manifest not found: {normalized}")
+    payload = _safe_json_file_load(normalized)
+    if not isinstance(payload, dict):
+        raise LiveCaptureError("manifest_invalid", f"Manifest is not valid JSON: {normalized}")
+    return payload
+
+
+def _check_wav_header(path: str) -> bool:
+    """Validate WAV header readability."""
+    try:
+        if sf is not None:
+            with sf.SoundFile(path, mode="r") as handle:
+                return int(handle.samplerate) > 0 and int(handle.channels) > 0
+    except Exception:
+        pass
+
+    try:
+        import wave
+        with wave.open(path, "rb") as handle:
+            return (
+                int(handle.getframerate()) > 0
+                and int(handle.getnchannels()) > 0
+                and int(handle.getnframes()) >= 0
+            )
+    except Exception:
+        return False
+
+
+def _wait_for_export_payload(
+    manifest_path: str,
+    export_dir: str,
+    missing: List[str]
+) -> Dict[str, Any]:
+    """Return standardized WAIT_FOR_USER_EXPORT payload."""
+    return {
+        "ok": True,
+        "ready": False,
+        "status": "WAIT_FOR_USER_EXPORT",
+        "message_to_user": (
+            "Export the listed WAVs to the export folder, then rerun check_exports_ready."
+        ),
+        "missing": missing,
+        "export_dir": export_dir,
+        "manifest_path": manifest_path
+    }
+
+
+def _range_payload_for_item(
+    session_payload: Dict[str, Any],
+    item: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Resolve item bar/time range to seconds with no max-duration cap."""
+    return _resolve_capture_range_seconds(
+        session_payload=session_payload,
+        start_bar=item.get("start_bar"),
+        end_bar=item.get("end_bar"),
+        start_time_sec=item.get("start_time_sec"),
+        duration_sec=item.get("duration_sec"),
+        max_duration_sec=None
+    )
 
 
 def _coerce_json_dict(payload: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -3766,6 +4510,1015 @@ def save_device_classifications(
         "classified_total": len(existing),
         "current_inventory_hash": current_inventory_hash,
         "submitted_inventory_hash": inventory_hash
+    }
+
+
+@mcp.tool()
+def scan_arrangement_activity(
+    ctx: Context,
+    target: str,
+    track_index: Optional[int] = None,
+    include_children: bool = False,
+    bar_resolution: int = 1,
+    start_bar: Optional[int] = None,
+    end_bar: Optional[int] = None
+) -> Dict[str, Any]:
+    """
+    Scan arrangement clip activity by bar range (structural, no audio decoding).
+
+    Parameters:
+    - target: "track" | "group" | "mix"
+    - track_index: required for target "track"/"group"
+    - include_children: include child tracks for group target
+    - bar_resolution: bars per timeline bucket
+    - start_bar/end_bar: optional scan range (inclusive)
+    """
+    _ = ctx
+    try:
+        target_request = _normalize_arrangement_target(target=target, track_index=track_index)
+        ableton = get_ableton_connection()
+        session_payload = ableton.send_command("get_session_info")
+        if not isinstance(session_payload, dict):
+            raise LiveCaptureError("invalid_session_info", "Failed to retrieve session info")
+
+        track_rows = _get_tracks_mixer_state_rows(ableton)
+        if not track_rows:
+            raise LiveCaptureError("track_scan_failed", "No tracks available in session")
+
+        try:
+            resolution = max(1, int(bar_resolution))
+        except Exception:
+            raise LiveCaptureError("invalid_bar_resolution", "bar_resolution must be an integer >= 1")
+
+        requested_track_index = target_request.get("track_index")
+        warnings: List[str] = []
+
+        if target_request["target"] == "track":
+            indices = [int(requested_track_index)]
+        elif target_request["target"] == "group":
+            indices = _collect_group_tree_indices(
+                track_rows=track_rows,
+                group_track_index=int(requested_track_index),
+                include_children=bool(include_children)
+            )
+        else:
+            if include_children:
+                indices = [int(row["track_index"]) for row in track_rows if isinstance(row.get("track_index"), int)]
+            else:
+                indices = [
+                    int(row["track_index"])
+                    for row in track_rows
+                    if isinstance(row.get("track_index"), int) and row.get("track_kind") != "group"
+                ]
+            if not indices:
+                warnings.append("mix_filter_result_empty_falling_back_to_all_tracks")
+                indices = [int(row["track_index"]) for row in track_rows if isinstance(row.get("track_index"), int)]
+
+        intervals, interval_warnings = _collect_arrangement_intervals_for_tracks(ctx, indices)
+        warnings.extend(interval_warnings)
+
+        tempo = float(session_payload.get("tempo"))
+        signature_numerator = int(session_payload.get("signature_numerator"))
+        signature_denominator = int(session_payload.get("signature_denominator"))
+        beats_per_bar = _beats_per_bar(signature_numerator, signature_denominator)
+
+        if start_bar is None:
+            resolved_start_bar = 1
+        else:
+            try:
+                resolved_start_bar = int(start_bar)
+            except Exception:
+                raise LiveCaptureError("invalid_start_bar", "start_bar must be an integer")
+            if resolved_start_bar < 1:
+                raise LiveCaptureError("invalid_start_bar", "start_bar must be >= 1")
+
+        if end_bar is None:
+            max_end_beat = 0.0
+            for row in intervals:
+                try:
+                    max_end_beat = max(max_end_beat, float(row.get("end_beat", 0.0)))
+                except Exception:
+                    continue
+            if max_end_beat <= 0.0:
+                resolved_end_bar = resolved_start_bar
+            else:
+                resolved_end_bar = max(resolved_start_bar, int(math.ceil(max_end_beat / beats_per_bar)))
+        else:
+            try:
+                resolved_end_bar = int(end_bar)
+            except Exception:
+                raise LiveCaptureError("invalid_end_bar", "end_bar must be an integer")
+            if resolved_end_bar < resolved_start_bar:
+                raise LiveCaptureError("invalid_range", "end_bar must be >= start_bar")
+
+        timeline = _build_activity_timeline(
+            intervals=intervals,
+            beats_per_bar=beats_per_bar,
+            start_bar=resolved_start_bar,
+            end_bar=resolved_end_bar,
+            bar_resolution=resolution
+        )
+
+        result = {
+            "ok": True,
+            "target": target_request["target"],
+            "track_index": requested_track_index,
+            "include_children": bool(include_children),
+            "bar_resolution": int(resolution),
+            "start_bar": int(resolved_start_bar),
+            "end_bar": int(resolved_end_bar),
+            "bars": timeline["bars"],
+            "first_active_bar": timeline["first_active_bar"],
+            "active_bar_count": int(timeline["active_bar_count"]),
+            "detected_activity": bool(timeline["detected_activity"]),
+            "track_indices_scanned": indices,
+            "track_count_scanned": len(indices),
+            "clip_interval_count": len(intervals),
+            "tempo": tempo,
+            "signature_numerator": signature_numerator,
+            "signature_denominator": signature_denominator
+        }
+        if warnings:
+            result["warnings"] = warnings
+        return result
+    except LiveCaptureError as exc:
+        return {
+            "ok": False,
+            "error": exc.code,
+            "message": exc.message,
+            "bars": [],
+            "first_active_bar": None,
+            "active_bar_count": 0,
+            "detected_activity": False
+        }
+    except Exception as exc:
+        logger.error(f"Error scanning arrangement activity: {str(exc)}")
+        return {
+            "ok": False,
+            "error": "scan_arrangement_activity_failed",
+            "message": str(exc),
+            "bars": [],
+            "first_active_bar": None,
+            "active_bar_count": 0,
+            "detected_activity": False
+        }
+
+
+@mcp.tool()
+def analyze_audio_file(
+    ctx: Context,
+    wav_path: str,
+    window_sec: float = _DEFAULT_AUDIO_WINDOW_SEC,
+    rms_threshold_db: float = _DEFAULT_RMS_THRESHOLD_DBFS,
+    start_time_sec: Optional[float] = None,
+    duration_sec: Optional[float] = None,
+    auto_trim_silence: bool = True
+) -> Dict[str, Any]:
+    """
+    Analyze an audio file for signal presence, dynamics, and spectral balance.
+
+    Parameters:
+    - wav_path: absolute or launch-cwd-relative path to WAV/MP3/AIF/FLAC/M4A file
+    - window_sec: analysis window size in seconds
+    - rms_threshold_db: silence threshold in dBFS
+    - start_time_sec/duration_sec: optional segment selection
+    - auto_trim_silence: trim leading silence for metrics
+    """
+    _ = ctx
+    try:
+        normalized_input_path = _normalize_source_path(wav_path)
+        input_format = _audio_input_format(normalized_input_path)
+        file_exists, stat_size, stat_mtime = _safe_file_stats(normalized_input_path)
+        if not file_exists:
+            return {
+                "ok": False,
+                "error": "MISSING_WAV",
+                "status": "WAIT_FOR_USER_EXPORT",
+                "message": "Audio file does not exist yet. Export it first, then rerun analyze_audio_file.",
+                "wav_path": normalized_input_path,
+                "export_dir": get_export_dir()
+            }
+        if stat_size is None or stat_mtime is None:
+            return {
+                "ok": False,
+                "error": "stat_failed",
+                "message": "Could not read audio file metadata",
+                "wav_path": normalized_input_path
+            }
+        if input_format not in _ANALYZE_AUDIO_INPUT_FORMATS:
+            return {
+                "ok": False,
+                "error": "unsupported_audio_format",
+                "message": (
+                    "Supported formats: "
+                    + ", ".join(sorted(_ANALYZE_AUDIO_INPUT_FORMATS))
+                ),
+                "wav_path": normalized_input_path
+            }
+
+        cache_input = {
+            "version": _AUDIO_ANALYSIS_CACHE_VERSION,
+            "source_path": normalized_input_path,
+            "input_format": input_format,
+            "stat_size": int(stat_size),
+            "stat_mtime": float(stat_mtime),
+            "window_sec": float(window_sec),
+            "rms_threshold_db": float(rms_threshold_db),
+            "start_time_sec": None if start_time_sec is None else float(start_time_sec),
+            "duration_sec": None if duration_sec is None else float(duration_sec),
+            "auto_trim_silence": bool(auto_trim_silence)
+        }
+        cache_key = _audio_analysis_cache_key(cache_input)
+        cache_path = _audio_analysis_cache_path(cache_key)
+        cached = _load_audio_analysis_cache(cache_path)
+        if isinstance(cached, dict) and cached.get("ok") is True:
+            result = dict(cached)
+            if "original_path" not in result:
+                result["original_path"] = normalized_input_path
+            if "input_format" not in result:
+                result["input_format"] = input_format
+            if input_format != "wav" and "decoded_wav_path" not in result:
+                decoded_path = _decoded_wav_cache_path(
+                    source_path=normalized_input_path,
+                    stat_size=int(stat_size),
+                    stat_mtime=float(stat_mtime)
+                )
+                decoded_exists, decoded_size, _ = _safe_file_stats(decoded_path)
+                if decoded_exists and isinstance(decoded_size, int) and decoded_size > 44:
+                    result["decoded_wav_path"] = decoded_path
+            result["cache_hit"] = True
+            return result
+
+        analysis_wav_path, decoded_wav_path = _decode_source_to_wav(
+            source_path=normalized_input_path,
+            input_format=input_format,
+            stat_size=int(stat_size),
+            stat_mtime=float(stat_mtime)
+        )
+
+        analysis = analyze_wav_file(
+            wav_path=analysis_wav_path,
+            window_sec=float(window_sec),
+            rms_threshold_db=float(rms_threshold_db),
+            start_time_sec=start_time_sec,
+            duration_sec=duration_sec,
+            auto_trim_silence=bool(auto_trim_silence)
+        )
+        result = dict(analysis)
+        result["analyzed_at"] = _utc_now_iso()
+        result["original_path"] = normalized_input_path
+        result["input_format"] = input_format
+        if isinstance(decoded_wav_path, str):
+            result["decoded_wav_path"] = decoded_wav_path
+        result["cache_hit"] = False
+        _write_audio_analysis_cache(cache_path, result)
+        return result
+    except (AudioAnalysisError, LiveCaptureError) as exc:
+        return {
+            "ok": False,
+            "error": exc.code,
+            "message": exc.message,
+            "wav_path": _normalize_source_path(wav_path)
+        }
+    except Exception as exc:
+        logger.error(f"Error analyzing audio file '{wav_path}': {str(exc)}")
+        return {
+            "ok": False,
+            "error": "analyze_audio_file_failed",
+            "message": str(exc),
+            "wav_path": _normalize_source_path(wav_path)
+        }
+
+
+@mcp.tool()
+def scan_audio_presence_from_file(
+    ctx: Context,
+    wav_path: str,
+    start_time_sec: Optional[float] = None,
+    duration_sec: Optional[float] = None,
+    window_sec: float = _DEFAULT_AUDIO_WINDOW_SEC,
+    rms_threshold_db: float = _DEFAULT_RMS_THRESHOLD_DBFS
+) -> Dict[str, Any]:
+    """
+    Presence-focused wrapper over analyze_audio_file for exported audio files.
+    """
+    analysis = analyze_audio_file(
+        ctx=ctx,
+        wav_path=wav_path,
+        window_sec=window_sec,
+        rms_threshold_db=rms_threshold_db,
+        start_time_sec=start_time_sec,
+        duration_sec=duration_sec,
+        auto_trim_silence=False
+    )
+    if not isinstance(analysis, dict) or not analysis.get("ok"):
+        if isinstance(analysis, dict):
+            return analysis
+        return {
+            "ok": False,
+            "error": "scan_audio_presence_from_file_failed",
+            "message": "Unexpected analysis response"
+        }
+
+    return {
+        "ok": True,
+        "wav_path": analysis.get("wav_path"),
+        "windows": analysis.get("windows", []),
+        "first_signal_time_sec": analysis.get("first_signal_time_sec"),
+        "overall_peak_dbfs": analysis.get("overall_peak_dbfs"),
+        "detected_audio": bool(analysis.get("detected_audio")),
+        "cache_hit": bool(analysis.get("cache_hit", False))
+    }
+
+
+@mcp.tool()
+def export_instructions_for_section(
+    ctx: Context,
+    target: str,
+    track_index: Optional[int] = None,
+    start_bar: Optional[int] = None,
+    end_bar: Optional[int] = None,
+    start_time_sec: Optional[float] = None,
+    duration_sec: Optional[float] = None,
+    suggest_filename: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Build manual Ableton export instructions for a section (no loopback required).
+    """
+    _ = ctx
+    try:
+        target_request = _normalize_arrangement_target(target=target, track_index=track_index)
+        ableton = get_ableton_connection()
+        session_payload = ableton.send_command("get_session_info")
+        if not isinstance(session_payload, dict):
+            raise LiveCaptureError("invalid_session_info", "Failed to retrieve session info")
+
+        range_payload = _resolve_capture_range_seconds(
+            session_payload=session_payload,
+            start_bar=start_bar,
+            end_bar=end_bar,
+            start_time_sec=start_time_sec,
+            duration_sec=duration_sec,
+            max_duration_sec=None
+        )
+
+        track_rows = _get_tracks_mixer_state_rows(ableton)
+        track_lookup = {
+            int(row["track_index"]): row
+            for row in track_rows
+            if isinstance(row, dict) and isinstance(row.get("track_index"), int)
+        }
+
+        selected_track = None
+        if target_request["target"] in {"track", "group"}:
+            selected_track = track_lookup.get(int(target_request["track_index"]))
+            if selected_track is None:
+                raise LiveCaptureError("invalid_track_index", f"track_index {target_request['track_index']} out of range")
+
+        suggested_name = _suggest_export_filename(
+            target=target_request["target"],
+            track_index=target_request.get("track_index"),
+            suggest_filename=suggest_filename,
+            start_sec=range_payload["start_sec"],
+            end_sec=range_payload["end_sec"]
+        )
+        suggested_output_path = os.path.join(get_export_dir(), suggested_name)
+
+        instructions: List[str] = []
+        instructions.append("Open the Live set in Arrangement View.")
+        instructions.append(
+            "Set the time selection from "
+            + _format_clock(range_payload["start_sec"])
+            + " to "
+            + _format_clock(range_payload["end_sec"])
+            + f" (duration {range_payload['duration_sec']:.3f}s)."
+        )
+
+        if target_request["target"] == "mix":
+            instructions.append("Leave all intended mix tracks active; do not solo a single track.")
+        elif target_request["target"] == "track":
+            track_name = selected_track.get("track_name") if isinstance(selected_track, dict) else None
+            instructions.append(
+                "Solo track "
+                + str(target_request["track_index"])
+                + (f" ({track_name})" if isinstance(track_name, str) and track_name else "")
+                + " for export."
+            )
+        else:
+            track_name = selected_track.get("track_name") if isinstance(selected_track, dict) else None
+            instructions.append(
+                "Solo group track "
+                + str(target_request["track_index"])
+                + (f" ({track_name})" if isinstance(track_name, str) and track_name else "")
+                + " so child tracks are rendered through the group."
+            )
+
+        instructions.append("Go to File -> Export Audio/Video.")
+        instructions.append("Set file format to WAV (PCM), bit depth 24-bit, normalize OFF.")
+        instructions.append("Set sample rate to match the project sample rate.")
+        instructions.append("Save the export to: " + suggested_output_path)
+        instructions.append("Then run analyze_audio_file with that WAV path.")
+
+        return {
+            "ok": True,
+            "export_type": target_request["target"],
+            "track_index": target_request.get("track_index"),
+            "start_time_sec": round(range_payload["start_sec"], 6),
+            "end_time_sec": round(range_payload["end_sec"], 6),
+            "duration_sec": round(range_payload["duration_sec"], 6),
+            "instructions": instructions,
+            "suggested_output_path": suggested_output_path
+        }
+    except LiveCaptureError as exc:
+        return {
+            "ok": False,
+            "error": exc.code,
+            "message": exc.message,
+            "instructions": []
+        }
+    except Exception as exc:
+        logger.error(f"Error building export instructions: {str(exc)}")
+        return {
+            "ok": False,
+            "error": "export_instructions_for_section_failed",
+            "message": str(exc),
+            "instructions": []
+        }
+
+
+@mcp.tool()
+def plan_exports(
+    ctx: Context,
+    job_name: str,
+    items: List[Dict[str, Any]],
+    wav_settings: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    Build a deterministic manual-export plan and persist an export manifest.
+
+    If audio analysis is requested and no WAV path exists yet, this tool should be
+    called first to plan exports and produce expected output paths.
+    """
+    _ = ctx
+    try:
+        if not isinstance(job_name, str) or not job_name.strip():
+            raise LiveCaptureError("invalid_job_name", "job_name must be a non-empty string")
+        if not isinstance(items, list) or not items:
+            raise LiveCaptureError("invalid_items", "items must be a non-empty list")
+
+        pathing_info = ensure_dirs_exist()
+        export_dir = str(pathing_info.get("export_dir"))
+        analysis_dir = str(pathing_info.get("analysis_dir"))
+        warnings: List[str] = []
+        pathing_warnings = pathing_info.get("warnings", [])
+        if isinstance(pathing_warnings, list):
+            warnings.extend(pathing_warnings)
+
+        ableton = get_ableton_connection()
+        session_payload = ableton.send_command("get_session_info")
+        if not isinstance(session_payload, dict):
+            raise LiveCaptureError("invalid_session_info", "Failed to retrieve session info")
+
+        tempo = float(session_payload.get("tempo"))
+        signature_numerator = int(session_payload.get("signature_numerator"))
+        signature_denominator = int(session_payload.get("signature_denominator"))
+        beats_per_bar = _beats_per_bar(signature_numerator, signature_denominator)
+
+        track_rows = _get_tracks_mixer_state_rows(ableton)
+        track_lookup = {
+            int(row["track_index"]): row
+            for row in track_rows
+            if isinstance(row, dict) and isinstance(row.get("track_index"), int)
+        }
+
+        normalized_wav_settings = _normalize_wav_settings(wav_settings)
+        timestamp_token = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        job_token = _sanitize_filename_token(job_name, fallback="export_job")
+
+        planned_items: List[Dict[str, Any]] = []
+        manifest_items: List[Dict[str, Any]] = []
+        expected_paths: List[str] = []
+
+        for idx, item in enumerate(items):
+            if not isinstance(item, dict):
+                raise LiveCaptureError("invalid_items", f"items[{idx}] must be an object")
+
+            target_request = _normalize_arrangement_target(
+                target=item.get("target"),
+                track_index=item.get("track_index")
+            )
+            range_payload = _range_payload_for_item(session_payload=session_payload, item=item)
+
+            start_bar_value = range_payload.get("start_bar")
+            if not isinstance(start_bar_value, int):
+                start_bar_value = _seconds_to_bar_number(
+                    seconds=range_payload["start_sec"],
+                    tempo=tempo,
+                    beats_per_bar=beats_per_bar
+                )
+            end_bar_value = range_payload.get("end_bar")
+            if not isinstance(end_bar_value, int):
+                end_bar_value = _seconds_to_bar_number(
+                    seconds=max(range_payload["start_sec"], range_payload["end_sec"] - 1e-9),
+                    tempo=tempo,
+                    beats_per_bar=beats_per_bar
+                )
+
+            item_id = f"{job_token}__item_{idx + 1:02d}"
+            track_token = ""
+            if target_request["target"] in {"track", "group"}:
+                track_token = f"__track{int(target_request['track_index'])}"
+
+            hint_token = ""
+            filename_hint = item.get("filename_hint")
+            if isinstance(filename_hint, str) and filename_hint.strip():
+                hint_token = "__" + _sanitize_filename_token(filename_hint, fallback="section")
+
+            suggested_filename = (
+                f"{job_token}__{target_request['target']}"
+                f"{track_token}__bars{int(start_bar_value)}-{int(end_bar_value)}"
+                f"{hint_token}__{timestamp_token}.wav"
+            )
+            suggested_output_path = os.path.join(export_dir, suggested_filename)
+
+            instructions = [
+                "Open the Live set in Arrangement View.",
+                (
+                    "Set the time selection from "
+                    + _format_clock(range_payload["start_sec"])
+                    + " to "
+                    + _format_clock(range_payload["end_sec"])
+                    + f" (bars {int(start_bar_value)}-{int(end_bar_value)})."
+                )
+            ]
+
+            if target_request["target"] == "mix":
+                instructions.append("Rendered Track: Master.")
+            else:
+                track_row = track_lookup.get(int(target_request["track_index"]))
+                track_name = track_row.get("track_name") if isinstance(track_row, dict) else None
+                if target_request["target"] == "track":
+                    instructions.append(
+                        "Solo track "
+                        + str(target_request["track_index"])
+                        + (f" ({track_name})" if isinstance(track_name, str) and track_name else "")
+                        + " before export."
+                    )
+                else:
+                    instructions.append(
+                        "Solo group track "
+                        + str(target_request["track_index"])
+                        + (f" ({track_name})" if isinstance(track_name, str) and track_name else "")
+                        + " to render group output."
+                    )
+                instructions.append("Rendered Track: Selected Tracks Only.")
+
+            instructions.extend([
+                "Go to File -> Export Audio/Video.",
+                (
+                    "Set WAV export: bit depth "
+                    + str(normalized_wav_settings["bit_depth"])
+                    + "-bit, sample rate "
+                    + str(normalized_wav_settings["sample_rate"])
+                    + ", normalize "
+                    + ("ON" if normalized_wav_settings["normalize"] else "OFF")
+                    + ", dither "
+                    + ("ON" if normalized_wav_settings["dither"] else "OFF")
+                    + "."
+                ),
+                "Save exported WAV to: " + suggested_output_path
+            ])
+
+            planned_items.append({
+                "item_id": item_id,
+                "target": target_request["target"],
+                "track_index": target_request.get("track_index"),
+                "start_time_sec": round(range_payload["start_sec"], 6),
+                "end_time_sec": round(range_payload["end_sec"], 6),
+                "suggested_output_path": suggested_output_path,
+                "instructions": instructions
+            })
+
+            manifest_items.append({
+                "item_id": item_id,
+                "target": target_request["target"],
+                "track_index": target_request.get("track_index"),
+                "start_bar": int(start_bar_value),
+                "end_bar": int(end_bar_value),
+                "start_time_sec": round(range_payload["start_sec"], 6),
+                "end_time_sec": round(range_payload["end_sec"], 6),
+                "duration_sec": round(range_payload["duration_sec"], 6),
+                "suggested_filename": suggested_filename,
+                "suggested_output_path": suggested_output_path,
+                "instructions": instructions
+            })
+            expected_paths.append(suggested_output_path)
+
+        manifest_path = os.path.join(analysis_dir, _export_manifest_filename(job_name))
+        manifest_payload = {
+            "schema_version": 1,
+            "created_at": _utc_now_iso(),
+            "job_name": job_name,
+            "export_dir": export_dir,
+            "analysis_dir": analysis_dir,
+            "session": {
+                "tempo": tempo,
+                "signature_numerator": signature_numerator,
+                "signature_denominator": signature_denominator,
+                "track_count": session_payload.get("track_count")
+            },
+            "wav_settings": normalized_wav_settings,
+            "items": manifest_items,
+            "expected_paths": expected_paths
+        }
+        _safe_json_file_write(manifest_path, manifest_payload)
+
+        result = {
+            "ok": True,
+            "job_name": job_name,
+            "export_dir": export_dir,
+            "analysis_dir": analysis_dir,
+            "manifest_path": manifest_path,
+            "wav_settings": normalized_wav_settings,
+            "items": planned_items
+        }
+        if warnings:
+            result["warnings"] = warnings
+        return result
+    except LiveCaptureError as exc:
+        return {
+            "ok": False,
+            "error": exc.code,
+            "message": exc.message,
+            "items": []
+        }
+    except Exception as exc:
+        logger.error(f"Error planning exports: {str(exc)}")
+        return {
+            "ok": False,
+            "error": "plan_exports_failed",
+            "message": str(exc),
+            "items": []
+        }
+
+
+@mcp.tool()
+def check_exports_ready(
+    ctx: Context,
+    manifest_path: Optional[str] = None,
+    job_name: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Check whether all expected WAV exports from a manifest are present and readable.
+    """
+    _ = ctx
+    try:
+        resolved_manifest_path = _resolve_export_manifest_path(
+            manifest_path=manifest_path,
+            job_name=job_name
+        )
+        manifest = _load_export_manifest(resolved_manifest_path)
+
+        export_dir_value = manifest.get("export_dir")
+        if not isinstance(export_dir_value, str) or not export_dir_value.strip():
+            export_dir_value = get_export_dir()
+
+        expected_paths_raw = manifest.get("expected_paths", [])
+        expected_paths: List[str] = []
+        if isinstance(expected_paths_raw, list):
+            for value in expected_paths_raw:
+                if isinstance(value, str) and value.strip():
+                    expected_paths.append(_normalize_source_path(value))
+        if not expected_paths:
+            raise LiveCaptureError("manifest_invalid", "Manifest has no expected_paths")
+
+        present = []
+        missing = []
+        for path in expected_paths:
+            file_exists, stat_size, stat_mtime = _safe_file_stats(path)
+            header_ok = _check_wav_header(path) if file_exists else False
+            if file_exists and isinstance(stat_size, int) and stat_size > 0 and header_ok:
+                modified_at = None
+                if isinstance(stat_mtime, float):
+                    modified_at = datetime.fromtimestamp(stat_mtime, tz=timezone.utc).isoformat()
+                present.append({
+                    "path": path,
+                    "bytes": stat_size,
+                    "modified_at": modified_at
+                })
+            else:
+                missing.append(path)
+
+        if missing:
+            payload = _wait_for_export_payload(
+                manifest_path=resolved_manifest_path,
+                export_dir=export_dir_value,
+                missing=missing
+            )
+            payload["present"] = present
+            return payload
+
+        return {
+            "ok": True,
+            "ready": True,
+            "missing": [],
+            "present": present,
+            "manifest_path": resolved_manifest_path,
+            "export_dir": export_dir_value
+        }
+    except LiveCaptureError as exc:
+        return {
+            "ok": False,
+            "error": exc.code,
+            "message": exc.message
+        }
+    except Exception as exc:
+        logger.error(f"Error checking exports ready: {str(exc)}")
+        return {
+            "ok": False,
+            "error": "check_exports_ready_failed",
+            "message": str(exc)
+        }
+
+
+@mcp.tool()
+def analyze_export_job(
+    ctx: Context,
+    manifest_path: Optional[str] = None,
+    job_name: Optional[str] = None,
+    window_sec: float = _DEFAULT_AUDIO_WINDOW_SEC,
+    rms_threshold_db: float = _DEFAULT_RMS_THRESHOLD_DBFS
+) -> Dict[str, Any]:
+    """
+    Analyze all exported WAVs in a manifest. Returns WAIT_FOR_USER_EXPORT if missing.
+    """
+    try:
+        readiness = check_exports_ready(ctx=ctx, manifest_path=manifest_path, job_name=job_name)
+        if not isinstance(readiness, dict):
+            return {
+                "ok": False,
+                "error": "invalid_readiness_response",
+                "message": "check_exports_ready returned non-dict response"
+            }
+        if readiness.get("ok") is not True:
+            return readiness
+        if readiness.get("ready") is not True:
+            return readiness
+
+        resolved_manifest_path = _resolve_export_manifest_path(
+            manifest_path=manifest_path or readiness.get("manifest_path"),
+            job_name=job_name
+        )
+        manifest = _load_export_manifest(resolved_manifest_path)
+
+        job_name_value = manifest.get("job_name")
+        if not isinstance(job_name_value, str) or not job_name_value.strip():
+            job_name_value = "export_job"
+        job_token = _sanitize_filename_token(job_name_value, fallback="export_job")
+
+        analysis_dir = manifest.get("analysis_dir")
+        if not isinstance(analysis_dir, str) or not analysis_dir.strip():
+            analysis_dir = get_analysis_dir()
+        os.makedirs(analysis_dir, exist_ok=True)
+
+        items = manifest.get("items", [])
+        if not isinstance(items, list):
+            raise LiveCaptureError("manifest_invalid", "Manifest items must be a list")
+
+        results = []
+        peak_values = []
+        rms_values = []
+        notes = []
+
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                notes.append(f"item_{index}:invalid_item_entry")
+                continue
+
+            item_id = item.get("item_id")
+            if not isinstance(item_id, str) or not item_id.strip():
+                item_id = f"{job_token}__item_{index + 1:02d}"
+
+            wav_path = item.get("suggested_output_path")
+            if not isinstance(wav_path, str) or not wav_path.strip():
+                notes.append(f"{item_id}:missing_wav_path")
+                continue
+
+            analysis = analyze_audio_file(
+                ctx=ctx,
+                wav_path=wav_path,
+                window_sec=window_sec,
+                rms_threshold_db=rms_threshold_db,
+                auto_trim_silence=True
+            )
+
+            analysis_file_name = (
+                f"{job_token}__{_sanitize_filename_token(item_id, fallback='item')}"
+                "__analysis.json"
+            )
+            analysis_json_path = os.path.join(analysis_dir, analysis_file_name)
+            _safe_json_file_write(analysis_json_path, analysis if isinstance(analysis, dict) else {"ok": False})
+
+            entry = {
+                "item_id": item_id,
+                "wav_path": _normalize_source_path(wav_path),
+                "analysis_json_path": analysis_json_path
+            }
+
+            if isinstance(analysis, dict) and analysis.get("ok"):
+                entry["detected_audio"] = bool(analysis.get("detected_audio"))
+                entry["first_signal_time_sec"] = analysis.get("first_signal_time_sec")
+                entry["metrics"] = analysis.get("metrics")
+                metrics = analysis.get("metrics", {})
+                if isinstance(metrics, dict):
+                    peak_db = metrics.get("overall_peak_dbfs")
+                    rms_db = metrics.get("overall_rms_dbfs")
+                    if isinstance(peak_db, (int, float)):
+                        peak_values.append(float(peak_db))
+                    if isinstance(rms_db, (int, float)):
+                        rms_values.append(float(rms_db))
+            else:
+                entry["detected_audio"] = False
+                entry["first_signal_time_sec"] = None
+                if isinstance(analysis, dict):
+                    entry["error"] = analysis.get("error")
+                    entry["message"] = analysis.get("message")
+                notes.append(f"{item_id}:analysis_failed")
+
+            results.append(entry)
+
+        summary = {
+            "count": len(results),
+            "any_missing": False,
+            "loudest_peak_dbfs": max(peak_values) if peak_values else None,
+            "average_rms_dbfs": (sum(rms_values) / len(rms_values)) if rms_values else None,
+            "notes": notes
+        }
+
+        return {
+            "ok": True,
+            "job_name": job_name_value,
+            "results": results,
+            "summary": summary
+        }
+    except LiveCaptureError as exc:
+        return {
+            "ok": False,
+            "error": exc.code,
+            "message": exc.message
+        }
+    except Exception as exc:
+        logger.error(f"Error analyzing export job: {str(exc)}")
+        return {
+            "ok": False,
+            "error": "analyze_export_job_failed",
+            "message": str(exc)
+        }
+
+
+@mcp.tool()
+def suggest_export_ranges(
+    ctx: Context,
+    target: str,
+    track_index: Optional[int] = None,
+    include_children: bool = False,
+    bar_resolution: int = 1,
+    min_active_bars: int = 1,
+    max_ranges: int = 5
+) -> Dict[str, Any]:
+    """
+    Suggest contiguous active bar ranges for export based on arrangement activity.
+    """
+    activity = scan_arrangement_activity(
+        ctx=ctx,
+        target=target,
+        track_index=track_index,
+        include_children=include_children,
+        bar_resolution=bar_resolution
+    )
+    if not isinstance(activity, dict) or not activity.get("ok"):
+        if isinstance(activity, dict):
+            return activity
+        return {
+            "ok": False,
+            "error": "suggest_export_ranges_failed",
+            "message": "scan_arrangement_activity returned invalid response"
+        }
+
+    bars = activity.get("bars", [])
+    if not isinstance(bars, list):
+        bars = []
+
+    try:
+        resolution = max(1, int(activity.get("bar_resolution", bar_resolution)))
+        min_bars = max(1, int(min_active_bars))
+        max_ranges_value = max(1, int(max_ranges))
+    except Exception:
+        return {
+            "ok": False,
+            "error": "invalid_range_params",
+            "message": "bar_resolution, min_active_bars, and max_ranges must be integers"
+        }
+
+    ranges = []
+    current_start = None
+    current_end_bucket = None
+    previous_bar = None
+    for row in bars:
+        if not isinstance(row, dict):
+            continue
+        bar_value = row.get("bar")
+        has_clip = bool(row.get("has_clip"))
+        if not isinstance(bar_value, int):
+            try:
+                bar_value = int(bar_value)
+            except Exception:
+                continue
+
+        if has_clip:
+            if current_start is None:
+                current_start = bar_value
+                current_end_bucket = bar_value
+            elif previous_bar is not None and bar_value == previous_bar + resolution:
+                current_end_bucket = bar_value
+            else:
+                end_bar_value = int(current_end_bucket + resolution - 1)
+                length_bars = max(1, end_bar_value - int(current_start) + 1)
+                if length_bars >= min_bars:
+                    ranges.append({
+                        "start_bar": int(current_start),
+                        "end_bar": end_bar_value,
+                        "length_bars": length_bars
+                    })
+                current_start = bar_value
+                current_end_bucket = bar_value
+        else:
+            if current_start is not None:
+                end_bar_value = int(current_end_bucket + resolution - 1)
+                length_bars = max(1, end_bar_value - int(current_start) + 1)
+                if length_bars >= min_bars:
+                    ranges.append({
+                        "start_bar": int(current_start),
+                        "end_bar": end_bar_value,
+                        "length_bars": length_bars
+                    })
+                current_start = None
+                current_end_bucket = None
+        previous_bar = bar_value
+
+    if current_start is not None and current_end_bucket is not None:
+        end_bar_value = int(current_end_bucket + resolution - 1)
+        length_bars = max(1, end_bar_value - int(current_start) + 1)
+        if length_bars >= min_bars:
+            ranges.append({
+                "start_bar": int(current_start),
+                "end_bar": end_bar_value,
+                "length_bars": length_bars
+            })
+
+    ranges.sort(key=lambda entry: (-int(entry["length_bars"]), int(entry["start_bar"])))
+    ranges = ranges[:max_ranges_value]
+
+    return {
+        "ok": True,
+        "target": activity.get("target"),
+        "track_index": activity.get("track_index"),
+        "bar_resolution": resolution,
+        "min_active_bars": min_bars,
+        "max_ranges": max_ranges_value,
+        "detected_activity": bool(activity.get("detected_activity")),
+        "first_active_bar": activity.get("first_active_bar"),
+        "ranges": ranges
+    }
+
+
+@mcp.tool()
+def get_export_workflow_help(ctx: Context) -> Dict[str, Any]:
+    """Return canonical human-in-the-loop export workflow guidance."""
+    _ = ctx
+    pathing = resolve_pathing()
+    export_dir = pathing.get("export_dir")
+    analysis_dir = pathing.get("analysis_dir")
+    return {
+        "ok": True,
+        "message": (
+            "AbletonMCP uses manual exports as a reliable bridge for audio analysis: "
+            "plan exports first, export WAVs in Ableton, then run analysis tools once files exist."
+        ),
+        "steps": [
+            "Call plan_exports with job_name and items.",
+            "Export each WAV in Ableton to the suggested output paths.",
+            "Call check_exports_ready and wait until ready=true.",
+            "Call analyze_export_job to analyze all exported files."
+        ],
+        "recommended_settings": [
+            "WAV (PCM), 24-bit by default",
+            "Normalize OFF",
+            "Dither OFF",
+            "Sample rate = project"
+        ],
+        "export_dir": export_dir,
+        "analysis_dir": analysis_dir
     }
 
 
