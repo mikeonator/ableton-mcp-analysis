@@ -419,17 +419,27 @@ class AbletonMCP(ControlSurface):
                     "class_name": device.class_name,
                     "type": self._get_device_type(device)
                 })
+
+            # Some track-like objects can raise on state access (for example arm on non-armable tracks).
+            # Keep fields stable but nullable when Live does not expose the property safely.
+            mute = self._safe_track_state(track, "mute")
+            solo = self._safe_track_state(track, "solo")
+            arm = self._safe_track_state(track, "arm")
+
+            mixer_device = self._safe_attr(track, "mixer_device")
+            volume = self._safe_attr(self._safe_attr(mixer_device, "volume"), "value")
+            panning = self._safe_attr(self._safe_attr(mixer_device, "panning"), "value")
             
             result = {
                 "index": track_index,
                 "name": track.name,
-                "is_audio_track": track.has_audio_input,
-                "is_midi_track": track.has_midi_input,
-                "mute": track.mute,
-                "solo": track.solo,
-                "arm": track.arm,
-                "volume": track.mixer_device.volume.value,
-                "panning": track.mixer_device.panning.value,
+                "is_audio_track": self._safe_track_state(track, "has_audio_input"),
+                "is_midi_track": self._safe_track_state(track, "has_midi_input"),
+                "mute": mute,
+                "solo": solo,
+                "arm": arm,
+                "volume": volume,
+                "panning": panning,
                 "clip_slots": clip_slots,
                 "devices": devices
             }
@@ -731,10 +741,20 @@ class AbletonMCP(ControlSurface):
         """Best-effort attribute access."""
         if obj is None:
             return None
-        if not hasattr(obj, attr_name):
-            return None
         try:
             return getattr(obj, attr_name)
+        except Exception:
+            return None
+
+    def _safe_track_state(self, track, attr_name):
+        """Best-effort bool/nullable track-state read for fields like mute/solo/arm."""
+        value = self._safe_attr(track, attr_name)
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        try:
+            return bool(value)
         except Exception:
             return None
 

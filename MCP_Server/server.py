@@ -2516,12 +2516,20 @@ def snapshot_project_state(ctx: Context, include_device_hashes: bool = True) -> 
 
         include_hashes = bool(include_device_hashes)
         for track_index in range(track_count):
-            track_info = ableton.send_command("get_track_info", {"track_index": track_index})
+            try:
+                track_info = ableton.send_command("get_track_info", {"track_index": track_index})
+            except Exception as exc:
+                track_info = {}
+                warnings.append(f"track_info_failed:{track_index}:{str(exc)}")
             if not isinstance(track_info, dict):
                 track_info = {}
                 warnings.append(f"track_info_invalid:{track_index}")
 
-            chain_payload = ableton.send_command("get_track_devices", {"track_index": track_index})
+            try:
+                chain_payload = ableton.send_command("get_track_devices", {"track_index": track_index})
+            except Exception as exc:
+                chain_payload = {"ok": False}
+                warnings.append(f"track_device_chain_failed:{track_index}:{str(exc)}")
             if not isinstance(chain_payload, dict):
                 chain_payload = {"ok": False}
                 warnings.append(f"track_device_chain_invalid:{track_index}")
