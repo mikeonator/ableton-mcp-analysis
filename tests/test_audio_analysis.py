@@ -24,6 +24,18 @@ def _write_wav_mono_16bit(path: Path, samples: np.ndarray, sample_rate: int) -> 
         wf.writeframes(pcm.tobytes())
 
 
+def _write_wav_stereo_16bit(path: Path, samples: np.ndarray, sample_rate: int) -> None:
+    clipped = np.clip(samples, -1.0, 1.0)
+    if clipped.ndim != 2 or clipped.shape[1] != 2:
+        raise ValueError("samples must be Nx2")
+    pcm = (clipped * 32767.0).astype(np.int16)
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(2)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm.reshape((-1,)).tobytes())
+
+
 class AnalyzeWavFileTests(unittest.TestCase):
     def test_detects_first_signal_with_leading_silence(self) -> None:
         sr = 48000
@@ -166,6 +178,65 @@ class AnalyzeWavFileTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "FFMPEG_NOT_FOUND")
+
+    def test_analyze_mastering_file_reports_stereo_metrics_and_clipping(self) -> None:
+        sr = 48000
+        duration_sec = 2.0
+        t = np.arange(int(sr * duration_sec), dtype=np.float32) / float(sr)
+        # Opposite-polarity channels yield strong negative correlation and mono cancellation.
+        left = 1.2 * np.sin(2.0 * math.pi * 997.0 * t).astype(np.float32)
+        right = -left
+        stereo = np.stack([left, right], axis=1)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wav_path = Path(tmpdir) / "master_test.wav"
+            _write_wav_stereo_16bit(wav_path, stereo, sr)
+
+            result = server.analyze_mastering_file(None, str(wav_path), window_sec=0.25)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["channels"], 2)
+        self.assertIn("lufs_integrated", result)
+        self.assertIn("true_peak_dbtp", result)
+        self.assertIn("stereo_correlation_series", result)
+        self.assertGreaterEqual(len(result["stereo_correlation_series"]), 1)
+        self.assertIsInstance(result["clipped_sample_count"], int)
+        self.assertGreater(result["clipped_sample_count"], 0)
+
+        corr_values = [
+            row["correlation"]
+            for row in result["stereo_correlation_series"]
+            if isinstance(row, dict) and isinstance(row.get("correlation"), (int, float))
+        ]
+        self.assertTrue(corr_values)
+        self.assertLess(max(corr_values), -0.7)
+
+        self.assertLessEqual(
+            float(result["sample_peak_dbfs"]),
+            0.0
+        )
+        self.assertGreaterEqual(
+            float(result["true_peak_dbtp"]),
+            float(result["sample_peak_dbfs"]) - 0.25
+        )
+        self.assertIsInstance(result.get("summary"), str)
+        self.assertTrue(result["summary"])
+
+    def test_analyze_mastering_file_handles_mono_sources(self) -> None:
+        sr = 44100
+        t = np.arange(sr, dtype=np.float32) / float(sr)
+        mono = 0.25 * np.sin(2.0 * math.pi * 220.0 * t).astype(np.float32)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wav_path = Path(tmpdir) / "mono_master.wav"
+            _write_wav_mono_16bit(wav_path, mono, sr)
+            result = server.analyze_mastering_file(None, str(wav_path), window_sec=0.5)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["channels"], 1)
+        self.assertEqual(result["stereo_correlation_series"], [])
+        self.assertIsNone(result["stereo_width_score"])
+        self.assertIsInstance(result.get("analysis_notes"), list)
 
 
 if __name__ == "__main__":

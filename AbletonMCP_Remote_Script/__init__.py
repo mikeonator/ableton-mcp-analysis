@@ -253,13 +253,33 @@ class AbletonMCP(ControlSurface):
                 response["result"] = self._get_transport_state()
             elif command_type == "get_tracks_mixer_state":
                 response["result"] = self._get_tracks_mixer_state()
+            elif command_type == "get_mix_topology":
+                include_device_chains = params.get("include_device_chains", True)
+                include_device_parameters = params.get("include_device_parameters", False)
+                response["result"] = self._get_mix_topology(
+                    include_device_chains=include_device_chains,
+                    include_device_parameters=include_device_parameters
+                )
+            elif command_type == "get_automation_envelope_points":
+                response["result"] = self._get_automation_envelope_points(
+                    track_index=params.get("track_index", 0),
+                    scope=params.get("scope", "track_mixer"),
+                    mixer_target=params.get("mixer_target", "volume"),
+                    send_index=params.get("send_index", None),
+                    device_index=params.get("device_index", None),
+                    parameter_index=params.get("parameter_index", None),
+                    start_time_beats=params.get("start_time_beats", None),
+                    end_time_beats=params.get("end_time_beats", None),
+                    sample_points=params.get("sample_points", 0)
+                )
             # Commands that modify Live's state should be scheduled on the main thread
             elif command_type in ["create_midi_track", "set_track_name", 
                                  "create_clip", "add_notes_to_clip", "set_clip_name", 
                                  "set_tempo", "fire_clip", "stop_clip",
                                  "start_playback", "stop_playback", "load_browser_item",
                                  "load_instrument_or_effect",
-                                 "set_transport_state", "set_tracks_mixer_state"]:
+                                 "set_transport_state", "set_tracks_mixer_state",
+                                 "set_device_parameter"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -319,6 +339,14 @@ class AbletonMCP(ControlSurface):
                         elif command_type == "set_tracks_mixer_state":
                             states = params.get("states", [])
                             result = self._set_tracks_mixer_state(states)
+                        elif command_type == "set_device_parameter":
+                            track_index = params.get("track_index", 0)
+                            device_index = params.get("device_index", 0)
+                            parameter_index = params.get("parameter_index", 0)
+                            value = params.get("value", 0.0)
+                            result = self._set_device_parameter(
+                                track_index, device_index, parameter_index, value
+                            )
                         
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
@@ -1185,6 +1213,902 @@ class AbletonMCP(ControlSurface):
             "automation_state": automation_state
         }
 
+    def _safe_text(self, value):
+        """Convert values to JSON-safe text when possible."""
+        if value is None:
+            return None
+        if isinstance(value, string_types):
+            text = value.strip()
+            return text or None
+        try:
+            text = str(value).strip()
+            return text or None
+        except Exception:
+            return None
+
+    def _serialize_routing_choice(self, value):
+        """Serialize routing selector objects (best effort)."""
+        if value is None:
+            return None
+
+        for attr_name in ["display_name", "name"]:
+            text = self._safe_text(self._safe_attr(value, attr_name))
+            if text:
+                return text
+
+        if isinstance(value, string_types):
+            return self._safe_text(value)
+
+        try:
+            return self._safe_text(str(value))
+        except Exception:
+            return None
+
+    def _serialize_mixer_parameter(self, parameter):
+        """Serialize a mixer device parameter value/range/enabled state."""
+        if parameter is None:
+            return {
+                "value": None,
+                "min": None,
+                "max": None,
+                "is_enabled": None,
+                "automation_state": None
+            }
+
+        value = self._json_scalar(self._safe_attr(parameter, "value"))
+        min_value = self._json_scalar(self._safe_attr(parameter, "min"))
+        max_value = self._json_scalar(self._safe_attr(parameter, "max"))
+
+        is_enabled = self._safe_attr(parameter, "is_enabled")
+        if not isinstance(is_enabled, bool):
+            is_enabled = None
+
+        automation_state_raw = self._safe_attr(parameter, "automation_state")
+        automation_state = self._json_scalar(automation_state_raw)
+        if automation_state is None and automation_state_raw is not None:
+            if isinstance(automation_state_raw, string_types):
+                automation_state = automation_state_raw
+            else:
+                try:
+                    automation_state = int(automation_state_raw)
+                except Exception:
+                    automation_state = None
+
+        return {
+            "value": value,
+            "min": min_value,
+            "max": max_value,
+            "is_enabled": is_enabled,
+            "automation_state": automation_state
+        }
+
+    def _serialize_device_chain(self, track_like, include_parameters=False):
+        """Serialize a generic track-like device chain."""
+        devices_raw = self._safe_attr(track_like, "devices")
+        devices = self._to_list(devices_raw)
+        if not isinstance(devices, list):
+            devices = []
+
+        device_entries = []
+        for device_index, device in enumerate(devices):
+            row = self._serialize_device_chain_entry(device_index, device)
+            if include_parameters:
+                parameters_raw = self._safe_attr(device, "parameters")
+                parameters = self._to_list(parameters_raw)
+                if not isinstance(parameters, list):
+                    parameters = []
+                row["parameters"] = [
+                    self._serialize_device_parameter(parameter_index, parameter)
+                    for parameter_index, parameter in enumerate(parameters)
+                ]
+            device_entries.append(row)
+        return device_entries
+
+    def _serialize_track_routing(self, track):
+        """Best-effort routing metadata for a track-like object."""
+        return {
+            "input_type": self._serialize_routing_choice(self._safe_attr(track, "input_routing_type")),
+            "input_channel": self._serialize_routing_choice(self._safe_attr(track, "input_routing_channel")),
+            "output_type": self._serialize_routing_choice(self._safe_attr(track, "output_routing_type")),
+            "output_channel": self._serialize_routing_choice(self._safe_attr(track, "output_routing_channel"))
+        }
+
+    def _serialize_track_sends(self, track, return_tracks):
+        """Serialize send slots for a track using return-track order."""
+        mixer_device = self._safe_attr(track, "mixer_device")
+        sends_raw = self._safe_attr(mixer_device, "sends")
+        sends = self._to_list(sends_raw)
+        if not isinstance(sends, list):
+            sends = []
+
+        rows = []
+        for send_index, send_param in enumerate(sends):
+            param_payload = self._serialize_mixer_parameter(send_param)
+            send_name = None
+            if isinstance(return_tracks, list) and send_index < len(return_tracks):
+                send_name = self._safe_text(self._safe_attr(return_tracks[send_index], "name"))
+            if not send_name:
+                send_name = self._safe_text(self._safe_attr(send_param, "name"))
+
+            row = {
+                "send_index": int(send_index),
+                "target_return_index": int(send_index) if isinstance(return_tracks, list) and send_index < len(return_tracks) else None,
+                "name": send_name,
+                "value": param_payload.get("value"),
+                "min": param_payload.get("min"),
+                "max": param_payload.get("max"),
+                "is_enabled": param_payload.get("is_enabled"),
+                "automation_state": param_payload.get("automation_state")
+            }
+            rows.append(row)
+        return rows
+
+    def _serialize_tracklike_mixer_state(self, track_like, include_arm=False):
+        """Serialize common mixer state from a track-like object."""
+        mixer_device = self._safe_attr(track_like, "mixer_device")
+        volume_param = self._safe_attr(mixer_device, "volume")
+        panning_param = self._safe_attr(mixer_device, "panning")
+
+        payload = {
+            "volume": self._json_scalar(self._safe_attr(volume_param, "value")),
+            "panning": self._json_scalar(self._safe_attr(panning_param, "value")),
+            "mute": self._safe_track_state(track_like, "mute"),
+            "solo": self._safe_track_state(track_like, "solo")
+        }
+        if include_arm:
+            payload["arm"] = self._safe_track_state(track_like, "arm")
+        return payload
+
+    def _serialize_track_topology_entry(self, song, track, track_index, return_tracks, include_device_chains, include_device_parameters):
+        """Serialize one normal track topology row."""
+        is_group_track, track_kind = self._infer_track_kind(track)
+        name = self._safe_text(self._safe_attr(track, "name"))
+        group_track_index = self._resolve_group_track_index(song, track)
+
+        row = {
+            "scope": "track",
+            "index": int(track_index),
+            "name": name,
+            "track_kind": track_kind,
+            "is_group_track": bool(is_group_track),
+            "group_track_index": group_track_index,
+            "mixer": self._serialize_tracklike_mixer_state(track, include_arm=True),
+            "sends": self._serialize_track_sends(track, return_tracks),
+            "routing": self._serialize_track_routing(track)
+        }
+
+        if include_device_chains:
+            row["devices"] = self._serialize_device_chain(track, include_parameters=include_device_parameters)
+        else:
+            row["devices"] = []
+
+        return row
+
+    def _serialize_return_topology_entry(self, track, return_index, include_device_chains, include_device_parameters):
+        """Serialize one return track topology row."""
+        name = self._safe_text(self._safe_attr(track, "name"))
+        row = {
+            "scope": "return",
+            "index": int(return_index),
+            "name": name,
+            "mixer": self._serialize_tracklike_mixer_state(track, include_arm=False),
+            "routing": self._serialize_track_routing(track)
+        }
+        if include_device_chains:
+            row["devices"] = self._serialize_device_chain(track, include_parameters=include_device_parameters)
+        else:
+            row["devices"] = []
+        return row
+
+    def _serialize_master_topology_entry(self, master_track, include_device_chains, include_device_parameters):
+        """Serialize master track topology row."""
+        name = self._safe_text(self._safe_attr(master_track, "name")) or "Master"
+        mixer_device = self._safe_attr(master_track, "mixer_device")
+        row = {
+            "scope": "master",
+            "name": name,
+            "mixer": {
+                "volume": self._json_scalar(self._safe_attr(self._safe_attr(mixer_device, "volume"), "value")),
+                "panning": self._json_scalar(self._safe_attr(self._safe_attr(mixer_device, "panning"), "value"))
+            }
+        }
+        if include_device_chains:
+            row["devices"] = self._serialize_device_chain(master_track, include_parameters=include_device_parameters)
+        else:
+            row["devices"] = []
+        return row
+
+    def _edge_target_from_output_type(self, output_type):
+        """Map output routing label to normalized edge target."""
+        if not isinstance(output_type, string_types):
+            return None
+        text = output_type.strip()
+        if not text:
+            return None
+        lowered = text.lower()
+        if "master" in lowered:
+            return "master"
+        return "output:" + text
+
+    def _get_mix_topology(self, include_device_chains=True, include_device_parameters=False):
+        """Return normalized routing/bus/send topology for tracks/returns/master."""
+        song = self._get_song()
+        if song is None:
+            return {
+                "ok": False,
+                "error": "song_unavailable",
+                "message": "Could not access song",
+                "tracks": [],
+                "returns": [],
+                "master": None,
+                "edges": [],
+                "warnings": ["song_unavailable"]
+            }
+
+        warnings = []
+        try:
+            include_device_chains = bool(include_device_chains)
+            include_device_parameters = bool(include_device_parameters)
+
+            tracks = self._to_list(self._safe_attr(song, "tracks"))
+            if not isinstance(tracks, list):
+                tracks = []
+
+            return_tracks = self._to_list(self._safe_attr(song, "return_tracks"))
+            if not isinstance(return_tracks, list):
+                return_tracks = []
+
+            track_rows = []
+            return_rows = []
+            edges = []
+
+            for track_index, track in enumerate(tracks):
+                try:
+                    row = self._serialize_track_topology_entry(
+                        song=song,
+                        track=track,
+                        track_index=track_index,
+                        return_tracks=return_tracks,
+                        include_device_chains=include_device_chains,
+                        include_device_parameters=include_device_parameters
+                    )
+                    track_rows.append(row)
+                except Exception as exc:
+                    warnings.append("track_serialize_failed:{0}:{1}".format(track_index, str(exc)))
+                    continue
+
+            for row in track_rows:
+                track_index = row.get("index")
+                group_track_index = row.get("group_track_index")
+                if isinstance(track_index, int) and isinstance(group_track_index, int):
+                    edges.append({
+                        "from": "track:{0}".format(track_index),
+                        "to": "track:{0}".format(group_track_index),
+                        "kind": "group_membership"
+                    })
+
+                sends = row.get("sends", [])
+                if isinstance(sends, list) and isinstance(track_index, int):
+                    for send in sends:
+                        if not isinstance(send, dict):
+                            continue
+                        send_index = send.get("send_index")
+                        target_return_index = send.get("target_return_index")
+                        amount = send.get("value")
+                        if not isinstance(send_index, int) or not isinstance(target_return_index, int):
+                            continue
+                        if not isinstance(amount, (int, float)):
+                            continue
+                        if float(amount) <= 0.0:
+                            continue
+                        edges.append({
+                            "from": "track:{0}".format(track_index),
+                            "to": "return:{0}".format(target_return_index),
+                            "kind": "send",
+                            "send_index": int(send_index),
+                            "amount": float(amount)
+                        })
+
+                routing = row.get("routing", {})
+                output_type = routing.get("output_type") if isinstance(routing, dict) else None
+                edge_target = self._edge_target_from_output_type(output_type)
+                if edge_target and isinstance(track_index, int):
+                    edges.append({
+                        "from": "track:{0}".format(track_index),
+                        "to": edge_target,
+                        "kind": "output_routing"
+                    })
+
+            for return_index, return_track in enumerate(return_tracks):
+                try:
+                    return_row = self._serialize_return_topology_entry(
+                        track=return_track,
+                        return_index=return_index,
+                        include_device_chains=include_device_chains,
+                        include_device_parameters=include_device_parameters
+                    )
+                    return_rows.append(return_row)
+                    edges.append({
+                        "from": "return:{0}".format(return_index),
+                        "to": "master",
+                        "kind": "output_routing"
+                    })
+                except Exception as exc:
+                    warnings.append("return_serialize_failed:{0}:{1}".format(return_index, str(exc)))
+
+            master_track = self._safe_attr(song, "master_track")
+            master_row = None
+            try:
+                if master_track is not None:
+                    master_row = self._serialize_master_topology_entry(
+                        master_track,
+                        include_device_chains=include_device_chains,
+                        include_device_parameters=include_device_parameters
+                    )
+                else:
+                    warnings.append("master_track_unavailable")
+            except Exception as exc:
+                warnings.append("master_serialize_failed:{0}".format(str(exc)))
+
+            return {
+                "ok": True,
+                "session": {
+                    "tempo": self._json_scalar(self._safe_attr(song, "tempo")),
+                    "signature_numerator": self._json_scalar(self._safe_attr(song, "signature_numerator")),
+                    "signature_denominator": self._json_scalar(self._safe_attr(song, "signature_denominator")),
+                    "track_count": len(track_rows),
+                    "return_track_count": len(return_rows)
+                },
+                "tracks": track_rows,
+                "returns": return_rows,
+                "master": master_row,
+                "edges": edges,
+                "warnings": warnings
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": "get_mix_topology_failed",
+                "message": str(e),
+                "tracks": [],
+                "returns": [],
+                "master": None,
+                "edges": [],
+                "warnings": warnings + ["get_mix_topology_failed"]
+            }
+
+    def _safe_int_param(self, value):
+        """Best-effort integer coercion for command params."""
+        try:
+            return int(value)
+        except Exception:
+            return None
+
+    def _safe_float_param(self, value):
+        """Best-effort finite float coercion for command params."""
+        scalar = self._json_scalar(value)
+        if isinstance(scalar, bool):
+            return None
+        if isinstance(scalar, (int, float)):
+            try:
+                out = float(scalar)
+            except Exception:
+                return None
+            try:
+                if out != out:
+                    return None
+                if out == float("inf") or out == float("-inf"):
+                    return None
+            except Exception:
+                return None
+            return out
+        return None
+
+    def _serialize_parameter_automation_state(self, parameter):
+        """Serialize parameter automation_state consistently across parameter types."""
+        automation_state_raw = self._safe_attr(parameter, "automation_state")
+        automation_state = self._json_scalar(automation_state_raw)
+        if automation_state is None and automation_state_raw is not None:
+            if isinstance(automation_state_raw, string_types):
+                automation_state = automation_state_raw
+            else:
+                try:
+                    automation_state = int(automation_state_raw)
+                except Exception:
+                    automation_state = None
+        return automation_state
+
+    def _infer_track_arrangement_time_range_beats(self, track):
+        """Best-effort track timeline range from arrangement clips."""
+        arrangement_raw = self._safe_attr(track, "arrangement_clips")
+        arrangement_clips = self._to_list(arrangement_raw)
+        if not isinstance(arrangement_clips, list) or len(arrangement_clips) == 0:
+            return None, None
+
+        starts = []
+        ends = []
+        for clip in arrangement_clips:
+            if clip is None:
+                continue
+            clip_info = self._clip_metadata(clip, 0)
+            start_time = clip_info.get("start_time_beats")
+            end_time = clip_info.get("end_time_beats")
+            if isinstance(start_time, (int, float)):
+                starts.append(float(start_time))
+            if isinstance(end_time, (int, float)):
+                ends.append(float(end_time))
+
+        if not starts and not ends:
+            return None, None
+
+        start_out = min(starts) if starts else None
+        end_out = max(ends) if ends else None
+        if start_out is not None and end_out is not None and end_out < start_out:
+            end_out = start_out
+        return start_out, end_out
+
+    def _serialize_envelope_point_row(self, point_index, point):
+        """Serialize one automation envelope point (best effort)."""
+        time_value = None
+        point_value = None
+        shape_value = None
+
+        if isinstance(point, dict):
+            for key in ["time_beats", "time", "beat_time", "x"]:
+                time_value = self._safe_float_param(point.get(key))
+                if isinstance(time_value, float):
+                    break
+            for key in ["value", "y"]:
+                point_value = self._safe_float_param(point.get(key))
+                if isinstance(point_value, float):
+                    break
+            shape_value = self._safe_text(point.get("shape")) or self._safe_text(point.get("curve"))
+        elif isinstance(point, (list, tuple)) and len(point) >= 2:
+            time_value = self._safe_float_param(point[0])
+            point_value = self._safe_float_param(point[1])
+            if len(point) >= 3:
+                shape_value = self._safe_text(point[2])
+        else:
+            for attr_name in ["time_beats", "time", "beat_time", "x"]:
+                time_value = self._safe_float_param(self._safe_attr(point, attr_name))
+                if isinstance(time_value, float):
+                    break
+            for attr_name in ["value", "y"]:
+                point_value = self._safe_float_param(self._safe_attr(point, attr_name))
+                if isinstance(point_value, float):
+                    break
+            shape_value = (
+                self._safe_text(self._safe_attr(point, "shape"))
+                or self._safe_text(self._safe_attr(point, "curve"))
+            )
+
+        if not isinstance(time_value, float) or not isinstance(point_value, float):
+            return None
+
+        row = {
+            "point_index": int(point_index),
+            "time_beats": float(time_value),
+            "value": float(point_value)
+        }
+        if shape_value:
+            row["shape"] = shape_value
+        return row
+
+    def _extract_envelope_points_best_effort(self, envelope):
+        """Probe common envelope point containers and return serialized rows."""
+        warnings = []
+        candidate_names = [
+            "points",
+            "breakpoints",
+            "break_points",
+            "envelope_points",
+            "automation_points",
+            "events",
+            "steps",
+            "nodes",
+            "get_points"
+        ]
+
+        for candidate in candidate_names:
+            raw = self._safe_attr(envelope, candidate)
+            if raw is None:
+                continue
+
+            source_kind = "attribute"
+            payload = raw
+            if callable(raw):
+                try:
+                    payload = raw()
+                    source_kind = "method"
+                except Exception as exc:
+                    warnings.append("envelope_point_probe_call_failed:{0}:{1}".format(candidate, str(exc)))
+                    continue
+
+            rows = None
+            if isinstance(payload, (list, tuple)):
+                rows = list(payload)
+            else:
+                rows = self._to_list(payload)
+
+            if not isinstance(rows, list):
+                warnings.append("envelope_point_probe_not_list:{0}".format(candidate))
+                continue
+
+            point_rows = []
+            for point_index, point in enumerate(rows):
+                point_row = self._serialize_envelope_point_row(point_index, point)
+                if point_row is not None:
+                    point_rows.append(point_row)
+
+            if point_rows:
+                try:
+                    point_rows.sort(key=lambda row: (row.get("time_beats", 0.0), row.get("point_index", 0)))
+                except Exception:
+                    pass
+                return {
+                    "point_access_supported": True,
+                    "points": point_rows,
+                    "source": candidate,
+                    "source_kind": source_kind,
+                    "warnings": warnings
+                }
+
+            warnings.append("envelope_point_probe_empty_or_unserializable:{0}".format(candidate))
+
+        return {
+            "point_access_supported": False,
+            "points": [],
+            "source": None,
+            "source_kind": None,
+            "warnings": warnings
+        }
+
+    def _sample_envelope_values(self, envelope, start_time_beats, end_time_beats, sample_points):
+        """Sample envelope values via value_at_time when direct point access is unavailable."""
+        value_at_time = self._safe_attr(envelope, "value_at_time")
+        if not callable(value_at_time):
+            return {
+                "supported": False,
+                "samples": [],
+                "reason": "value_at_time_unavailable"
+            }
+
+        start_value = self._safe_float_param(start_time_beats)
+        end_value = self._safe_float_param(end_time_beats)
+        count_value = self._safe_int_param(sample_points)
+
+        if start_value is None or end_value is None:
+            return {
+                "supported": False,
+                "samples": [],
+                "reason": "sample_range_missing"
+            }
+
+        if end_value < start_value:
+            end_value = start_value
+
+        if count_value is None or count_value <= 1:
+            return {
+                "supported": False,
+                "samples": [],
+                "reason": "invalid_sample_points"
+            }
+
+        if count_value > 2000:
+            count_value = 2000
+
+        samples = []
+        denominator = float(max(count_value - 1, 1))
+        for idx in range(count_value):
+            try:
+                ratio = float(idx) / denominator if denominator > 0.0 else 0.0
+                time_beats = float(start_value) + ((float(end_value) - float(start_value)) * ratio)
+                value = self._safe_float_param(value_at_time(time_beats))
+                samples.append({
+                    "sample_index": int(idx),
+                    "time_beats": float(time_beats),
+                    "value": value
+                })
+            except Exception as exc:
+                return {
+                    "supported": False,
+                    "samples": [],
+                    "reason": "value_at_time_failed",
+                    "message": str(exc)
+                }
+
+        return {
+            "supported": True,
+            "samples": samples,
+            "reason": None
+        }
+
+    def _resolve_automation_target_parameter(
+        self,
+        song,
+        track_index,
+        scope,
+        mixer_target,
+        send_index,
+        device_index,
+        parameter_index
+    ):
+        """Resolve a parameter object for automation envelope lookup."""
+        _, track, error_payload = self._resolve_track_by_index(track_index)
+        if error_payload is not None:
+            return None, None, error_payload
+
+        scope_text = self._safe_text(scope) or "track_mixer"
+        scope_key = scope_text.lower()
+
+        target_payload = {
+            "scope": scope_key,
+            "mixer_target": None,
+            "send_index": None,
+            "device_index": None,
+            "device_name": None,
+            "parameter_index": None,
+            "parameter_name": None
+        }
+
+        if scope_key in ("track_mixer", "mixer"):
+            mixer_device = self._safe_attr(track, "mixer_device")
+            if mixer_device is None:
+                return track, None, {
+                    "ok": False,
+                    "error": "mixer_device_unavailable",
+                    "message": "Track mixer_device unavailable",
+                    "track_index": track_index
+                }
+
+            mixer_target_text = (self._safe_text(mixer_target) or "volume").lower()
+            if mixer_target_text in ("volume", "gain"):
+                parameter = self._safe_attr(mixer_device, "volume")
+                target_payload["mixer_target"] = "volume"
+            elif mixer_target_text in ("panning", "pan"):
+                parameter = self._safe_attr(mixer_device, "panning")
+                target_payload["mixer_target"] = "panning"
+            elif mixer_target_text in ("send", "sends"):
+                target_payload["mixer_target"] = "send"
+                send_idx = self._safe_int_param(send_index)
+                if send_idx is None or send_idx < 0:
+                    return track, None, {
+                        "ok": False,
+                        "error": "invalid_send_index",
+                        "message": "send_index must be a non-negative integer",
+                        "track_index": track_index,
+                        "send_index": send_index
+                    }
+                sends = self._to_list(self._safe_attr(mixer_device, "sends"))
+                if not isinstance(sends, list):
+                    sends = []
+                if send_idx >= len(sends):
+                    return track, None, {
+                        "ok": False,
+                        "error": "invalid_send_index",
+                        "message": "send_index out of range",
+                        "track_index": track_index,
+                        "send_index": send_idx,
+                        "send_count": len(sends)
+                    }
+                parameter = sends[send_idx]
+                target_payload["send_index"] = int(send_idx)
+            else:
+                return track, None, {
+                    "ok": False,
+                    "error": "invalid_mixer_target",
+                    "message": "mixer_target must be one of: volume, panning, send",
+                    "track_index": track_index,
+                    "mixer_target": mixer_target
+                }
+
+            target_payload["scope"] = "track_mixer"
+            target_payload["parameter_name"] = self._safe_text(self._safe_attr(parameter, "name"))
+            return track, parameter, target_payload
+
+        if scope_key in ("device_parameter", "device"):
+            device_idx = self._safe_int_param(device_index)
+            param_idx = self._safe_int_param(parameter_index)
+            if device_idx is None or device_idx < 0:
+                return track, None, {
+                    "ok": False,
+                    "error": "invalid_device_index",
+                    "message": "device_index must be a non-negative integer",
+                    "track_index": track_index,
+                    "device_index": device_index
+                }
+            if param_idx is None or param_idx < 0:
+                return track, None, {
+                    "ok": False,
+                    "error": "invalid_parameter_index",
+                    "message": "parameter_index must be a non-negative integer",
+                    "track_index": track_index,
+                    "device_index": device_idx,
+                    "parameter_index": parameter_index
+                }
+
+            devices = self._to_list(self._safe_attr(track, "devices"))
+            if not isinstance(devices, list):
+                devices = []
+            if device_idx >= len(devices):
+                return track, None, {
+                    "ok": False,
+                    "error": "invalid_device_index",
+                    "message": "device_index out of range",
+                    "track_index": track_index,
+                    "device_index": device_idx,
+                    "device_count": len(devices)
+                }
+
+            device = devices[device_idx]
+            parameters = self._to_list(self._safe_attr(device, "parameters"))
+            if not isinstance(parameters, list):
+                parameters = []
+            if param_idx >= len(parameters):
+                return track, None, {
+                    "ok": False,
+                    "error": "invalid_parameter_index",
+                    "message": "parameter_index out of range",
+                    "track_index": track_index,
+                    "device_index": device_idx,
+                    "parameter_index": param_idx,
+                    "parameter_count": len(parameters)
+                }
+
+            parameter = parameters[param_idx]
+            target_payload["scope"] = "device_parameter"
+            target_payload["device_index"] = int(device_idx)
+            target_payload["device_name"] = self._safe_text(self._safe_attr(device, "name"))
+            target_payload["parameter_index"] = int(param_idx)
+            target_payload["parameter_name"] = self._safe_text(self._safe_attr(parameter, "name"))
+            return track, parameter, target_payload
+
+        return track, None, {
+            "ok": False,
+            "error": "invalid_scope",
+            "message": "scope must be 'track_mixer' or 'device_parameter'",
+            "track_index": track_index,
+            "scope": scope
+        }
+
+    def _get_automation_envelope_points(
+        self,
+        track_index,
+        scope="track_mixer",
+        mixer_target="volume",
+        send_index=None,
+        device_index=None,
+        parameter_index=None,
+        start_time_beats=None,
+        end_time_beats=None,
+        sample_points=0
+    ):
+        """Best-effort automation envelope point read for track mixer or device parameters."""
+        song = self._get_song()
+        track_idx = self._safe_int_param(track_index)
+        if song is None:
+            return {
+                "ok": False,
+                "error": "song_unavailable",
+                "message": "Could not access song"
+            }
+        if track_idx is None:
+            return {
+                "ok": False,
+                "error": "invalid_track_index",
+                "message": "track_index must be an integer",
+                "track_index": track_index
+            }
+
+        track, parameter, target_or_error = self._resolve_automation_target_parameter(
+            song=song,
+            track_index=track_idx,
+            scope=scope,
+            mixer_target=mixer_target,
+            send_index=send_index,
+            device_index=device_index,
+            parameter_index=parameter_index
+        )
+        if parameter is None:
+            if isinstance(target_or_error, dict):
+                return target_or_error
+            return {
+                "ok": False,
+                "error": "automation_target_resolution_failed",
+                "message": "Could not resolve automation parameter target",
+                "track_index": track_idx
+            }
+
+        target_payload = target_or_error if isinstance(target_or_error, dict) else {}
+        track_name = self._safe_text(self._safe_attr(track, "name"))
+        automation_state = self._serialize_parameter_automation_state(parameter)
+
+        result = {
+            "ok": True,
+            "supported": True,
+            "track_index": int(track_idx),
+            "track_name": track_name,
+            "target": target_payload,
+            "automation_state": automation_state,
+            "envelope_exists": False,
+            "point_access_supported": False,
+            "points": [],
+            "sampled_series": [],
+            "warnings": []
+        }
+
+        envelope_getter = self._safe_attr(song, "automation_envelope")
+        if not callable(envelope_getter):
+            result["supported"] = False
+            result["reason"] = "song_automation_envelope_unavailable"
+            result["warnings"].append("song_automation_envelope_unavailable")
+            return result
+
+        try:
+            envelope = envelope_getter(parameter)
+        except Exception as exc:
+            result["supported"] = False
+            result["reason"] = "automation_envelope_lookup_failed"
+            result["message"] = str(exc)
+            result["warnings"].append("automation_envelope_lookup_failed")
+            return result
+
+        if envelope is None:
+            result["envelope_exists"] = False
+            return result
+
+        result["envelope_exists"] = True
+        result["envelope_class_name"] = self._safe_text(self._safe_attr(envelope, "class_name")) or self._safe_text(type(envelope).__name__)
+
+        direct = self._extract_envelope_points_best_effort(envelope)
+        if isinstance(direct, dict):
+            result["point_access_supported"] = bool(direct.get("point_access_supported"))
+            result["points"] = direct.get("points", []) if isinstance(direct.get("points"), list) else []
+            if direct.get("source"):
+                result["point_source"] = direct.get("source")
+            if direct.get("source_kind"):
+                result["point_source_kind"] = direct.get("source_kind")
+            if isinstance(direct.get("warnings"), list):
+                result["warnings"].extend(direct.get("warnings"))
+
+        sample_count = self._safe_int_param(sample_points)
+        if (
+            (not isinstance(result.get("points"), list) or len(result.get("points", [])) == 0)
+            and isinstance(sample_count, int) and sample_count > 1
+        ):
+            start_value = self._safe_float_param(start_time_beats)
+            end_value = self._safe_float_param(end_time_beats)
+
+            if start_value is None or end_value is None:
+                inferred_start, inferred_end = self._infer_track_arrangement_time_range_beats(track)
+                if start_value is None:
+                    start_value = inferred_start
+                if end_value is None:
+                    end_value = inferred_end
+
+            sample_payload = self._sample_envelope_values(
+                envelope=envelope,
+                start_time_beats=start_value,
+                end_time_beats=end_value,
+                sample_points=sample_count
+            )
+            if isinstance(sample_payload, dict):
+                if bool(sample_payload.get("supported")):
+                    result["sampled_series"] = sample_payload.get("samples", [])
+                    result["sampled_series_kind"] = "value_at_time"
+                    result["sampled_range_beats"] = {
+                        "start": start_value,
+                        "end": end_value
+                    }
+                else:
+                    sample_reason = sample_payload.get("reason")
+                    if sample_reason:
+                        result["warnings"].append("sampled_series_unavailable:{0}".format(sample_reason))
+                    if sample_payload.get("message"):
+                        result["sampled_series_error"] = sample_payload.get("message")
+
+        return result
+
     def _get_track_devices(self, track_index):
         """Return the ordered device chain for a track."""
         try:
@@ -1338,6 +2262,114 @@ class AbletonMCP(ControlSurface):
                 "message": str(e),
                 "track_index": track_index,
                 "device_index": device_index
+            }
+
+    def _set_device_parameter(self, track_index, device_index, parameter_index, value):
+        """Set a parameter value for a device on a normal track."""
+        try:
+            song, track, error_payload = self._resolve_track_by_index(track_index)
+            if error_payload is not None:
+                return error_payload
+
+            try:
+                device_index = int(device_index)
+                parameter_index = int(parameter_index)
+            except Exception:
+                return {
+                    "ok": False,
+                    "error": "invalid_index",
+                    "message": "device_index and parameter_index must be integers",
+                    "track_index": track_index,
+                    "device_index": device_index,
+                    "parameter_index": parameter_index
+                }
+
+            devices = self._to_list(self._safe_attr(track, "devices"))
+            if not isinstance(devices, list):
+                devices = []
+            if device_index < 0 or device_index >= len(devices):
+                return {
+                    "ok": False,
+                    "error": "invalid_device_index",
+                    "message": "device_index out of range",
+                    "track_index": int(track_index),
+                    "device_index": int(device_index),
+                    "device_count": len(devices)
+                }
+
+            device = devices[device_index]
+            parameters = self._to_list(self._safe_attr(device, "parameters"))
+            if not isinstance(parameters, list):
+                parameters = []
+            if parameter_index < 0 or parameter_index >= len(parameters):
+                return {
+                    "ok": False,
+                    "error": "invalid_parameter_index",
+                    "message": "parameter_index out of range",
+                    "track_index": int(track_index),
+                    "device_index": int(device_index),
+                    "parameter_index": int(parameter_index),
+                    "parameter_count": len(parameters)
+                }
+
+            parameter = parameters[parameter_index]
+            before_value = self._json_scalar(self._safe_attr(parameter, "value"))
+            min_value = self._json_scalar(self._safe_attr(parameter, "min"))
+            max_value = self._json_scalar(self._safe_attr(parameter, "max"))
+
+            desired_value = value
+            try:
+                if not isinstance(desired_value, (int, float)):
+                    desired_value = float(desired_value)
+            except Exception:
+                return {
+                    "ok": False,
+                    "error": "invalid_value",
+                    "message": "value must be numeric",
+                    "track_index": int(track_index),
+                    "device_index": int(device_index),
+                    "parameter_index": int(parameter_index),
+                    "value": value
+                }
+
+            if isinstance(min_value, (int, float)):
+                desired_value = max(float(min_value), float(desired_value))
+            if isinstance(max_value, (int, float)):
+                desired_value = min(float(max_value), float(desired_value))
+
+            try:
+                parameter.value = desired_value
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "error": "set_device_parameter_failed",
+                    "message": str(exc),
+                    "track_index": int(track_index),
+                    "device_index": int(device_index),
+                    "parameter_index": int(parameter_index)
+                }
+
+            after_value = self._json_scalar(self._safe_attr(parameter, "value"))
+            return {
+                "ok": True,
+                "track_index": int(track_index),
+                "device_index": int(device_index),
+                "parameter_index": int(parameter_index),
+                "device_name": self._safe_text(self._safe_attr(device, "name")),
+                "parameter_name": self._safe_text(self._safe_attr(parameter, "name")),
+                "before": before_value,
+                "after": after_value,
+                "min": min_value,
+                "max": max_value
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": "set_device_parameter_failed",
+                "message": str(e),
+                "track_index": track_index,
+                "device_index": device_index,
+                "parameter_index": parameter_index
             }
     
     def _create_midi_track(self, index):

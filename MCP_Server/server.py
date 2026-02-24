@@ -253,8 +253,12 @@ _DEVICE_INVENTORY_CACHE_PATH = os.path.join(_SOURCE_CACHE_DIR, "device_inventory
 _PROJECT_SNAPSHOT_SCHEMA_VERSION = 1
 _PROJECT_SNAPSHOT_DIR = os.path.join(_SOURCE_CACHE_DIR, "project_snapshots")
 _AUDIO_ANALYSIS_CACHE_VERSION = 2
+_MIX_CONTEXT_TAGS_SCHEMA_VERSION = 1
+_MIX_CONTEXT_TAGS_FILE_NAME = "mix_context_tags.json"
 _DEFAULT_AUDIO_WINDOW_SEC = 1.0
 _DEFAULT_RMS_THRESHOLD_DBFS = -60.0
+_DEFAULT_MASTERING_TARGET_LUFS = -14.0
+_MASTERING_CLIP_THRESHOLD = 0.9999
 _DEVICE_CAPABILITY_BUCKETS = [
     "eq",
     "compression",
@@ -1510,6 +1514,359 @@ def _analyze_audio_source(file_path: str, stat_size: int, stat_mtime: float) -> 
     }
 
 
+def _series_percentile(values: List[float], pct: float) -> Optional[float]:
+    """Compute percentile from Python list using numpy when available."""
+    if np is None or not values:
+        return None
+    try:
+        return float(np.percentile(np.asarray(values, dtype=np.float64), pct))
+    except Exception:
+        return None
+
+
+def _window_loudness_series(
+    samples: Any,
+    sample_rate: int,
+    meter: Any,
+    window_sec: float,
+    hop_sec: float
+) -> List[Dict[str, Any]]:
+    """Compute sliding-window loudness series using pyloudnorm meter."""
+    if meter is None or pyln is None or np is None:
+        return []
+
+    window_frames = max(1, int(round(float(window_sec) * float(sample_rate))))
+    hop_frames = max(1, int(round(float(hop_sec) * float(sample_rate))))
+    total_frames = int(samples.shape[0])
+
+    rows: List[Dict[str, Any]] = []
+    if total_frames <= 0:
+        return rows
+
+    for start in range(0, max(total_frames - window_frames + 1, 1), hop_frames):
+        end = min(total_frames, start + window_frames)
+        segment = samples[start:end]
+        if segment.shape[0] <= 0:
+            continue
+        # pyloudnorm is unstable on tiny windows; skip clearly too-short tails.
+        if segment.shape[0] < max(4, int(0.25 * sample_rate)):
+            continue
+        try:
+            if segment.shape[1] == 1:
+                loudness = float(meter.integrated_loudness(segment[:, 0].astype(np.float64)))
+            else:
+                loudness = float(meter.integrated_loudness(segment.astype(np.float64)))
+        except Exception:
+            continue
+        if math.isnan(loudness) or math.isinf(loudness):
+            continue
+        rows.append({
+            "start_sec": round(float(start) / float(sample_rate), 6),
+            "duration_sec": round(float(end - start) / float(sample_rate), 6),
+            "lufs": round(loudness, 3)
+        })
+        if end >= total_frames:
+            break
+
+    return rows
+
+
+def _stereo_correlation_series(
+    samples: Any,
+    sample_rate: int,
+    window_sec: float
+) -> List[Dict[str, Any]]:
+    """Compute stereo correlation over fixed windows."""
+    if np is None or samples is None or int(samples.shape[0]) <= 0:
+        return []
+    if int(samples.shape[1]) < 2:
+        return []
+
+    lr = samples[:, :2].astype(np.float32)
+    window_frames = max(1, int(round(float(window_sec) * float(sample_rate))))
+    rows: List[Dict[str, Any]] = []
+
+    for start in range(0, int(lr.shape[0]), window_frames):
+        end = min(int(lr.shape[0]), start + window_frames)
+        segment = lr[start:end]
+        if int(segment.shape[0]) < 2:
+            continue
+        left = segment[:, 0].astype(np.float64)
+        right = segment[:, 1].astype(np.float64)
+        left_std = float(np.std(left))
+        right_std = float(np.std(right))
+        corr = 0.0
+        if left_std > 1e-12 and right_std > 1e-12:
+            try:
+                corr = float(np.corrcoef(left, right)[0, 1])
+            except Exception:
+                corr = 0.0
+        corr = max(-1.0, min(1.0, corr))
+        rows.append({
+            "start_sec": round(float(start) / float(sample_rate), 6),
+            "duration_sec": round(float(end - start) / float(sample_rate), 6),
+            "correlation": round(corr, 4)
+        })
+    return rows
+
+
+def _build_mastering_summary(
+    lufs_integrated: Optional[float],
+    true_peak_dbtp: Optional[float],
+    correlation_min: Optional[float],
+    stereo_width_score: Optional[float],
+    clipped_sample_count: int,
+    inter_sample_peak_risk: bool
+) -> str:
+    """Build deterministic mastering summary text."""
+    parts: List[str] = []
+    if lufs_integrated is not None:
+        parts.append(f"Integrated loudness {lufs_integrated:.1f} LUFS")
+    if true_peak_dbtp is not None:
+        parts.append(f"true peak {true_peak_dbtp:+.1f} dBTP")
+    if correlation_min is not None:
+        parts.append(f"min stereo corr {correlation_min:.2f}")
+    if stereo_width_score is not None:
+        parts.append(f"width score {stereo_width_score:.0f}/100")
+    if clipped_sample_count > 0:
+        parts.append(f"{clipped_sample_count} clipped samples")
+    if inter_sample_peak_risk:
+        parts.append("inter-sample peak risk")
+    if not parts:
+        parts.append("Mastering metrics unavailable")
+    summary = ", ".join(parts)
+    if not summary.endswith("."):
+        summary += "."
+    return summary
+
+
+def _analyze_mastering_source(
+    file_path: str,
+    stat_size: int,
+    stat_mtime: float,
+    window_sec: float = 1.0,
+    short_term_sec: float = 3.0,
+    momentary_sec: float = 0.4,
+    true_peak_threshold_dbtp: float = -1.0
+) -> Dict[str, Any]:
+    """Compute mastering-oriented analysis metrics for a decoded audio file."""
+    if np is None:
+        raise SourceAnalysisError("unsupported_decode_backend", "numpy is not available")
+    if window_sec <= 0.0:
+        raise SourceAnalysisError("invalid_window_sec", "window_sec must be > 0")
+    if short_term_sec <= 0.0 or momentary_sec <= 0.0:
+        raise SourceAnalysisError("invalid_window_sec", "short_term_sec and momentary_sec must be > 0")
+
+    samples, sample_rate, channels, decode_backend = _decode_audio_samples(file_path)
+    if samples.size == 0:
+        raise SourceAnalysisError("decode_failed", "Decoded audio is empty")
+
+    notes: List[str] = [f"decode_backend={decode_backend}"]
+    total_frames = int(samples.shape[0])
+    duration_sec = float(total_frames) / float(sample_rate) if sample_rate > 0 else 0.0
+
+    # Use first two channels for stereo metrics when multichannel content is provided.
+    stereo_view = samples[:, :2] if channels >= 2 else None
+    if channels > 2:
+        notes.append("stereo_metrics_use_first_two_channels")
+
+    mono = samples.mean(axis=1).astype(np.float32)
+    sample_peak = float(np.max(np.abs(samples)))
+    sample_peak_dbfs = _safe_db(sample_peak)
+    rms = float(np.sqrt(np.mean(np.square(mono, dtype=np.float64))))
+    rms_dbfs = _safe_db(rms)
+    crest_factor_db = float(sample_peak_dbfs - rms_dbfs)
+
+    true_peak = sample_peak
+    true_peak_dbtp = sample_peak_dbfs
+    if sp_signal is not None:
+        try:
+            channel_true_peaks: List[float] = []
+            for channel_index in range(samples.shape[1]):
+                oversampled = sp_signal.resample_poly(samples[:, channel_index], up=4, down=1)
+                channel_true_peaks.append(float(np.max(np.abs(oversampled))))
+            if channel_true_peaks:
+                true_peak = max(channel_true_peaks)
+                true_peak_dbtp = _safe_db(true_peak)
+        except Exception as exc:
+            notes.append(f"true_peak_fallback_sample_peak ({str(exc)})")
+    else:
+        notes.append("true_peak_fallback_sample_peak (scipy unavailable)")
+
+    meter = None
+    lufs_integrated: Optional[float] = None
+    lufs_short_term_series: List[Dict[str, Any]] = []
+    lufs_momentary_series: List[Dict[str, Any]] = []
+    loudness_range_lra: Optional[float] = None
+
+    if pyln is not None:
+        try:
+            meter = pyln.Meter(sample_rate)
+            if channels == 1:
+                lufs_integrated = float(meter.integrated_loudness(mono.astype(np.float64)))
+            else:
+                lufs_integrated = float(meter.integrated_loudness(samples.astype(np.float64)))
+            if math.isnan(lufs_integrated) or math.isinf(lufs_integrated):
+                lufs_integrated = None
+        except Exception as exc:
+            notes.append(f"lufs_unavailable ({str(exc)})")
+            meter = None
+            lufs_integrated = None
+    else:
+        notes.append("lufs_unavailable (pyloudnorm unavailable)")
+
+    if meter is not None:
+        lufs_short_term_series = _window_loudness_series(
+            samples=samples if channels > 1 else mono.reshape((-1, 1)),
+            sample_rate=sample_rate,
+            meter=meter,
+            window_sec=float(short_term_sec),
+            hop_sec=float(window_sec)
+        )
+        lufs_momentary_series = _window_loudness_series(
+            samples=samples if channels > 1 else mono.reshape((-1, 1)),
+            sample_rate=sample_rate,
+            meter=meter,
+            window_sec=float(momentary_sec),
+            hop_sec=float(window_sec)
+        )
+        try:
+            if hasattr(meter, "loudness_range"):
+                if channels == 1:
+                    loudness_range_lra = float(meter.loudness_range(mono.astype(np.float64)))
+                else:
+                    loudness_range_lra = float(meter.loudness_range(samples.astype(np.float64)))
+        except Exception as exc:
+            notes.append(f"lra_unavailable ({str(exc)})")
+
+    if loudness_range_lra is None and lufs_short_term_series:
+        short_vals = [float(row["lufs"]) for row in lufs_short_term_series if isinstance(row.get("lufs"), (int, float))]
+        p10 = _series_percentile(short_vals, 10.0)
+        p95 = _series_percentile(short_vals, 95.0)
+        if p10 is not None and p95 is not None:
+            loudness_range_lra = float(max(0.0, p95 - p10))
+            notes.append("lra_approximated_from_short_term_percentiles")
+
+    stereo_correlation = _stereo_correlation_series(samples, sample_rate, window_sec=float(window_sec))
+    correlation_values = [float(row["correlation"]) for row in stereo_correlation if isinstance(row.get("correlation"), (int, float))]
+    correlation_min = min(correlation_values) if correlation_values else None
+    correlation_avg = (sum(correlation_values) / len(correlation_values)) if correlation_values else None
+
+    mid_side_energy_ratio = None
+    mid_side_energy_ratio_db = None
+    stereo_width_score = None
+    mono_foldown_peak_delta_db = None
+    mono_foldown_rms_delta_db = None
+    dc_offset_l = None
+    dc_offset_r = None
+    if stereo_view is not None and int(stereo_view.shape[1]) >= 2:
+        left = stereo_view[:, 0].astype(np.float64)
+        right = stereo_view[:, 1].astype(np.float64)
+        mid = (left + right) * 0.5
+        side = (left - right) * 0.5
+        mid_rms = float(np.sqrt(np.mean(np.square(mid))))
+        side_rms = float(np.sqrt(np.mean(np.square(side))))
+        mid_side_energy_ratio = float(side_rms / max(mid_rms, 1e-12))
+        mid_side_energy_ratio_db = float(_safe_db(mid_side_energy_ratio))
+
+        channel_peak = max(float(np.max(np.abs(left))), float(np.max(np.abs(right))))
+        mono_peak = float(np.max(np.abs(mid)))
+        mono_foldown_peak_delta_db = float(_safe_db(mono_peak) - _safe_db(channel_peak))
+
+        channel_rms_avg = (
+            float(np.sqrt(np.mean(np.square(left)))) + float(np.sqrt(np.mean(np.square(right))))
+        ) / 2.0
+        mono_foldown_rms_delta_db = float(_safe_db(float(np.sqrt(np.mean(np.square(mid))))) - _safe_db(channel_rms_avg))
+
+        dc_offset_l = float(np.mean(left))
+        dc_offset_r = float(np.mean(right))
+
+        corr_basis = 0.0 if correlation_avg is None else float(correlation_avg)
+        width_linear = max(0.0, min(1.0, mid_side_energy_ratio / 1.0))
+        score = (0.55 * ((1.0 - corr_basis) / 2.0) + 0.45 * width_linear) * 100.0
+        stereo_width_score = float(max(0.0, min(100.0, score)))
+    elif channels == 1:
+        notes.append("stereo_metrics_unavailable_mono_source")
+    else:
+        notes.append("stereo_metrics_unavailable")
+
+    clipped_sample_count = int(np.sum(np.abs(samples) >= float(_MASTERING_CLIP_THRESHOLD)))
+    inter_sample_peak_risk = bool(
+        isinstance(true_peak_dbtp, (int, float)) and true_peak_dbtp > float(true_peak_threshold_dbtp)
+    )
+
+    max_samples = int(sample_rate * 120)
+    analysis_signal = mono[:max_samples] if mono.shape[0] > max_samples else mono
+    frequencies, spectrum = _average_spectrum_welch(analysis_signal, sample_rate)
+    spectrum_db = 20.0 * np.log10(np.maximum(spectrum, 1e-12))
+    band_energies_db = {
+        "sub_20_60": round(_band_energy_db(spectrum, frequencies, 20.0, 60.0), 3),
+        "low_60_200": round(_band_energy_db(spectrum, frequencies, 60.0, 200.0), 3),
+        "lowmid_200_500": round(_band_energy_db(spectrum, frequencies, 200.0, 500.0), 3),
+        "mid_500_2000": round(_band_energy_db(spectrum, frequencies, 500.0, 2000.0), 3),
+        "highmid_2000_6000": round(_band_energy_db(spectrum, frequencies, 2000.0, 6000.0), 3),
+        "air_6000_12000": round(_band_energy_db(spectrum, frequencies, 6000.0, 12000.0), 3),
+    }
+    resonant_peaks_hz = _find_resonant_peaks(frequencies, spectrum_db)
+
+    plr_db = None
+    if isinstance(lufs_integrated, (int, float)):
+        plr_db = float(true_peak_dbtp - lufs_integrated)
+
+    summary = _build_mastering_summary(
+        lufs_integrated=lufs_integrated,
+        true_peak_dbtp=true_peak_dbtp,
+        correlation_min=correlation_min,
+        stereo_width_score=stereo_width_score,
+        clipped_sample_count=clipped_sample_count,
+        inter_sample_peak_risk=inter_sample_peak_risk
+    )
+
+    return {
+        "ok": True,
+        "file_path": file_path,
+        "file_exists": True,
+        "stat_size": int(stat_size),
+        "stat_mtime": float(stat_mtime),
+        "analyzed_at": _utc_now_iso(),
+        "duration_sec": round(duration_sec, 4),
+        "sample_rate": int(sample_rate),
+        "channels": int(channels),
+        "window_sec": round(float(window_sec), 6),
+        "short_term_window_sec": round(float(short_term_sec), 6),
+        "momentary_window_sec": round(float(momentary_sec), 6),
+        "sample_peak": round(sample_peak, 6),
+        "sample_peak_dbfs": round(sample_peak_dbfs, 3),
+        "true_peak": round(float(true_peak), 6),
+        "true_peak_dbtp": round(float(true_peak_dbtp), 3),
+        "rms": round(rms, 6),
+        "rms_dbfs": round(rms_dbfs, 3),
+        "crest_factor_db": round(float(crest_factor_db), 3),
+        "lufs_integrated": None if lufs_integrated is None else round(float(lufs_integrated), 3),
+        "loudness_range_lra": None if loudness_range_lra is None else round(float(loudness_range_lra), 3),
+        "lufs_short_term_series": lufs_short_term_series,
+        "lufs_momentary_series": lufs_momentary_series,
+        "stereo_correlation_series": stereo_correlation,
+        "correlation_min": None if correlation_min is None else round(float(correlation_min), 4),
+        "correlation_avg": None if correlation_avg is None else round(float(correlation_avg), 4),
+        "mid_side_energy_ratio": None if mid_side_energy_ratio is None else round(float(mid_side_energy_ratio), 4),
+        "mid_side_energy_ratio_db": None if mid_side_energy_ratio_db is None else round(float(mid_side_energy_ratio_db), 3),
+        "stereo_width_score": None if stereo_width_score is None else round(float(stereo_width_score), 2),
+        "mono_foldown_peak_delta_db": None if mono_foldown_peak_delta_db is None else round(float(mono_foldown_peak_delta_db), 3),
+        "mono_foldown_rms_delta_db": None if mono_foldown_rms_delta_db is None else round(float(mono_foldown_rms_delta_db), 3),
+        "dc_offset_l": None if dc_offset_l is None else round(float(dc_offset_l), 8),
+        "dc_offset_r": None if dc_offset_r is None else round(float(dc_offset_r), 8),
+        "clipped_sample_count": clipped_sample_count,
+        "inter_sample_peak_risk": inter_sample_peak_risk,
+        "true_peak_threshold_dbtp": round(float(true_peak_threshold_dbtp), 3),
+        "plr_db": None if plr_db is None else round(float(plr_db), 3),
+        "band_energies_db": band_energies_db,
+        "resonant_peaks_hz": resonant_peaks_hz,
+        "summary": summary,
+        "analysis_notes": notes
+    }
+
+
 def _beats_per_bar(signature_numerator: int, signature_denominator: int) -> float:
     """Convert time signature into beats per bar."""
     if signature_numerator <= 0 or signature_denominator <= 0:
@@ -2315,6 +2672,533 @@ def _extract_browser_root_entries(browser_tree: Dict[str, Any]) -> List[Dict[str
     return entries
 
 
+def _safe_text_value(value: Any) -> Optional[str]:
+    """Return a trimmed string or None."""
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    if value is None:
+        return None
+    try:
+        stripped = str(value).strip()
+        return stripped or None
+    except Exception:
+        return None
+
+
+def _safe_int_value(value: Any) -> Optional[int]:
+    """Return int when coercion is safe."""
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _safe_float_value(value: Any) -> Optional[float]:
+    """Return float when coercion is safe and finite."""
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    if math.isnan(out) or math.isinf(out):
+        return None
+    return out
+
+
+def _normalize_topology_devices(devices: Any) -> List[Dict[str, Any]]:
+    """Normalize device-chain rows for topology payloads."""
+    rows: List[Dict[str, Any]] = []
+    if not isinstance(devices, list):
+        return rows
+
+    for device in devices:
+        if not isinstance(device, dict):
+            continue
+        device_index = _safe_int_value(device.get("device_index"))
+        row = {
+            "device_index": device_index,
+            "name": device.get("name"),
+            "class_name": device.get("class_name"),
+            "is_plugin": device.get("is_plugin"),
+            "plugin_format": device.get("plugin_format"),
+            "vendor": device.get("vendor"),
+            "parameter_count": device.get("parameter_count")
+        }
+        if isinstance(device.get("parameters"), list):
+            row["parameters"] = device.get("parameters")
+        rows.append(row)
+    return rows
+
+
+def _normalize_topology_track_row(row: Any, scope: str) -> Optional[Dict[str, Any]]:
+    """Normalize one topology row for tracks/returns."""
+    if not isinstance(row, dict):
+        return None
+    index = _safe_int_value(row.get("index"))
+    if index is None:
+        return None
+
+    mixer_raw = row.get("mixer", {})
+    mixer = mixer_raw if isinstance(mixer_raw, dict) else {}
+
+    normalized = {
+        "scope": scope,
+        "index": index,
+        "name": row.get("name"),
+        "mixer": {
+            "volume": mixer.get("volume"),
+            "panning": mixer.get("panning"),
+            "mute": mixer.get("mute"),
+            "solo": mixer.get("solo")
+        },
+        "routing": row.get("routing") if isinstance(row.get("routing"), dict) else {
+            "input_type": None,
+            "input_channel": None,
+            "output_type": None,
+            "output_channel": None,
+        },
+        "devices": _normalize_topology_devices(row.get("devices", []))
+    }
+
+    if scope == "track":
+        normalized["track_kind"] = row.get("track_kind")
+        normalized["is_group_track"] = bool(row.get("is_group_track"))
+        normalized["group_track_index"] = _safe_int_value(row.get("group_track_index"))
+        normalized["mixer"]["arm"] = mixer.get("arm")
+        sends_out = []
+        sends = row.get("sends", [])
+        if isinstance(sends, list):
+            for send in sends:
+                if not isinstance(send, dict):
+                    continue
+                sends_out.append({
+                    "send_index": _safe_int_value(send.get("send_index")),
+                    "target_return_index": _safe_int_value(send.get("target_return_index")),
+                    "name": send.get("name"),
+                    "value": send.get("value"),
+                    "min": send.get("min"),
+                    "max": send.get("max"),
+                    "is_enabled": send.get("is_enabled"),
+                    "automation_state": send.get("automation_state")
+                })
+        normalized["sends"] = sends_out
+    return normalized
+
+
+def _normalize_mix_topology_payload(payload: Any) -> Dict[str, Any]:
+    """Normalize backend mix topology response into a stable schema."""
+    if not isinstance(payload, dict):
+        return {
+            "ok": False,
+            "error": "invalid_response",
+            "message": "Backend returned non-dict topology response",
+            "session": {},
+            "tracks": [],
+            "returns": [],
+            "master": None,
+            "edges": [],
+            "warnings": ["invalid_response"]
+        }
+
+    session_raw = payload.get("session", {})
+    session = session_raw if isinstance(session_raw, dict) else {}
+    tracks = []
+    returns = []
+
+    for row in payload.get("tracks", []):
+        normalized = _normalize_topology_track_row(row, scope="track")
+        if normalized is not None:
+            tracks.append(normalized)
+
+    for row in payload.get("returns", []):
+        normalized = _normalize_topology_track_row(row, scope="return")
+        if normalized is not None:
+            returns.append(normalized)
+
+    master_payload = payload.get("master")
+    master = None
+    if isinstance(master_payload, dict):
+        master_mixer = master_payload.get("mixer", {})
+        master = {
+            "scope": "master",
+            "name": master_payload.get("name") or "Master",
+            "mixer": master_mixer if isinstance(master_mixer, dict) else {"volume": None, "panning": None},
+            "devices": _normalize_topology_devices(master_payload.get("devices", []))
+        }
+
+    edges = [row for row in payload.get("edges", []) if isinstance(row, dict)]
+    warnings = [str(row) for row in payload.get("warnings", [])] if isinstance(payload.get("warnings"), list) else []
+
+    normalized = {
+        "ok": bool(payload.get("ok", True)),
+        "session": {
+            "tempo": session.get("tempo"),
+            "signature_numerator": session.get("signature_numerator"),
+            "signature_denominator": session.get("signature_denominator"),
+            "track_count": session.get("track_count", len(tracks)),
+            "return_track_count": session.get("return_track_count", len(returns))
+        },
+        "tracks": sorted(tracks, key=lambda item: int(item["index"])),
+        "returns": sorted(returns, key=lambda item: int(item["index"])),
+        "master": master,
+        "edges": edges,
+        "warnings": warnings
+    }
+
+    if payload.get("error"):
+        normalized["error"] = payload.get("error")
+    if payload.get("message"):
+        normalized["message"] = payload.get("message")
+    return normalized
+
+
+def _derive_send_matrix_from_topology(topology: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a compact send matrix view from a normalized topology payload."""
+    rows: List[Dict[str, Any]] = []
+    active_routes: List[Dict[str, Any]] = []
+    return_lookup: Dict[int, Optional[str]] = {}
+
+    for return_row in topology.get("returns", []):
+        if isinstance(return_row, dict):
+            idx = _safe_int_value(return_row.get("index"))
+            if idx is not None:
+                return_lookup[idx] = _safe_text_value(return_row.get("name"))
+
+    for track in topology.get("tracks", []):
+        if not isinstance(track, dict):
+            continue
+        track_index = _safe_int_value(track.get("index"))
+        sends = track.get("sends", [])
+        if track_index is None or not isinstance(sends, list):
+            continue
+
+        send_rows = []
+        for send in sends:
+            if not isinstance(send, dict):
+                continue
+            send_index = _safe_int_value(send.get("send_index"))
+            target_return_index = _safe_int_value(send.get("target_return_index"))
+            amount = _safe_float_value(send.get("value"))
+            send_row = {
+                "send_index": send_index,
+                "target_return_index": target_return_index,
+                "target_return_name": (
+                    return_lookup.get(target_return_index)
+                    if isinstance(target_return_index, int)
+                    else None
+                ),
+                "name": send.get("name"),
+                "value": amount,
+                "is_enabled": send.get("is_enabled")
+            }
+            send_rows.append(send_row)
+
+            if (
+                isinstance(send_index, int)
+                and isinstance(target_return_index, int)
+                and isinstance(amount, float)
+                and amount > 0.0
+            ):
+                active_routes.append({
+                    "track_index": track_index,
+                    "track_name": track.get("name"),
+                    "send_index": send_index,
+                    "target_return_index": target_return_index,
+                    "target_return_name": return_lookup.get(target_return_index),
+                    "amount": amount
+                })
+
+        rows.append({
+            "track_index": track_index,
+            "track_name": track.get("name"),
+            "sends": send_rows
+        })
+
+    return {
+        "ok": bool(topology.get("ok")),
+        "track_count": len(rows),
+        "return_count": len(return_lookup),
+        "rows": rows,
+        "active_routes": active_routes,
+        "warnings": topology.get("warnings", []),
+    }
+
+
+def _mix_context_tags_file_path() -> str:
+    """Return project-relative mix context tags file path."""
+    ensure_dirs_exist()
+    return os.path.join(get_analysis_dir(), _MIX_CONTEXT_TAGS_FILE_NAME)
+
+
+def _empty_mix_context_tags_payload() -> Dict[str, Any]:
+    """Return stable empty mix-context tag payload."""
+    return {
+        "ok": True,
+        "schema_version": _MIX_CONTEXT_TAGS_SCHEMA_VERSION,
+        "updated_at": None,
+        "track_roles": {},
+        "return_roles": {},
+        "master_roles": [],
+        "metadata": {
+            "source": "manual",
+            "inference_version": 1
+        }
+    }
+
+
+def _normalize_role_token(value: Any) -> Optional[str]:
+    """Normalize role names into snake_case-ish tokens."""
+    token = _safe_text_value(value)
+    if token is None:
+        return None
+    normalized = re.sub(r"[^a-zA-Z0-9]+", "_", token.strip().lower()).strip("_")
+    return normalized or None
+
+
+def _normalize_role_list(values: Any) -> List[str]:
+    """Normalize and dedupe a list of roles preserving order."""
+    if not isinstance(values, list):
+        return []
+    out: List[str] = []
+    seen = set()
+    for value in values:
+        token = _normalize_role_token(value)
+        if token is None or token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+    return out
+
+
+def _normalize_role_map(payload: Any, prefix: str) -> Dict[str, List[str]]:
+    """Normalize role maps keyed by IDs like track:0 / return:0."""
+    out: Dict[str, List[str]] = {}
+    if not isinstance(payload, dict):
+        return out
+    for raw_key, raw_roles in payload.items():
+        key = _safe_text_value(raw_key)
+        if key is None:
+            continue
+        if ":" not in key:
+            key = f"{prefix}:{key}"
+        roles = _normalize_role_list(raw_roles)
+        if roles:
+            out[key] = roles
+    return out
+
+
+def _normalize_mix_context_tags_input(payload: Any) -> Dict[str, Any]:
+    """Normalize persisted or user-provided tag payload into stable schema."""
+    base = _empty_mix_context_tags_payload()
+    if not isinstance(payload, dict):
+        return base
+
+    metadata = payload.get("metadata", {})
+    metadata_out = dict(base["metadata"])
+    if isinstance(metadata, dict):
+        source_value = _safe_text_value(metadata.get("source"))
+        if source_value:
+            metadata_out["source"] = source_value
+        inference_version = _safe_int_value(metadata.get("inference_version"))
+        if inference_version is not None:
+            metadata_out["inference_version"] = inference_version
+
+    master_roles_raw = payload.get("master_roles")
+    if not isinstance(master_roles_raw, list) and isinstance(payload.get("master"), list):
+        master_roles_raw = payload.get("master")
+
+    normalized = {
+        "ok": True,
+        "schema_version": _MIX_CONTEXT_TAGS_SCHEMA_VERSION,
+        "updated_at": payload.get("updated_at"),
+        "track_roles": _normalize_role_map(payload.get("track_roles"), "track"),
+        "return_roles": _normalize_role_map(payload.get("return_roles"), "return"),
+        "master_roles": _normalize_role_list(master_roles_raw),
+        "metadata": metadata_out
+    }
+    return normalized
+
+
+def _load_mix_context_tags_payload() -> Dict[str, Any]:
+    """Load mix-context tags from analysis dir if present."""
+    path = _mix_context_tags_file_path()
+    if not os.path.exists(path):
+        payload = _empty_mix_context_tags_payload()
+        payload["tags_file_path"] = path
+        return payload
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+        payload = _normalize_mix_context_tags_input(raw)
+        payload["tags_file_path"] = path
+        return payload
+    except Exception as exc:
+        payload = _empty_mix_context_tags_payload()
+        payload["tags_file_path"] = path
+        payload["warnings"] = [f"tags_load_failed:{str(exc)}"]
+        return payload
+
+
+def _write_mix_context_tags_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Persist normalized mix-context tags to disk."""
+    normalized = _normalize_mix_context_tags_input(payload)
+    normalized["updated_at"] = _utc_now_iso()
+    path = _mix_context_tags_file_path()
+    ensure_dirs_exist()
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(normalized, handle, indent=2, sort_keys=True)
+    normalized["tags_file_path"] = path
+    return normalized
+
+
+def _merge_role_maps_prefer_explicit(
+    explicit_map: Dict[str, List[str]],
+    inferred_map: Dict[str, List[str]]
+) -> Dict[str, List[str]]:
+    """Merge inferred roles under explicit roles without overwriting explicit assignments."""
+    merged: Dict[str, List[str]] = {}
+    keys = sorted(set(explicit_map.keys()) | set(inferred_map.keys()))
+    for key in keys:
+        if key in explicit_map and explicit_map.get(key):
+            merged[key] = list(explicit_map[key])
+        elif key in inferred_map and inferred_map.get(key):
+            merged[key] = list(inferred_map[key])
+    return merged
+
+
+def _normalized_name_key(value: Any) -> str:
+    """Normalize names for heuristic matching."""
+    text = _safe_text_value(value) or ""
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def _infer_roles_from_name(name: str, scope: str, is_group_track: bool = False) -> Tuple[List[str], Dict[str, float]]:
+    """Infer semantic roles from track/return/master names."""
+    roles: List[str] = []
+    confidence: Dict[str, float] = {}
+    key = _normalized_name_key(name)
+    if not key:
+        return roles, confidence
+
+    def add(role: str, score: float) -> None:
+        if role not in roles:
+            roles.append(role)
+        current = confidence.get(role, 0.0)
+        confidence[role] = max(current, float(score))
+
+    # Track-oriented roles
+    if scope == "track":
+        if ("lead vocal" in key) or ("lead vox" in key) or (key.startswith("vox lead")) or ("leadvox" in key.replace(" ", "")):
+            add("lead_vocal", 0.98)
+        elif "vox" in key or "vocal" in key:
+            if "back" in key or "bgv" in key or "harmony" in key or "double" in key:
+                add("backing_vocal", 0.92)
+            else:
+                add("vocal", 0.75)
+        if "kick" in key:
+            add("kick", 0.96)
+        if "snare" in key or re.search(r"\bsn\b", key):
+            add("snare", 0.9)
+        if "bass" in key and "brass" not in key:
+            add("bass", 0.9)
+
+        if is_group_track:
+            if "drum" in key or "perc" in key:
+                add("drums_bus", 0.95)
+            if "gtr" in key or "guitar" in key:
+                add("guitars_bus", 0.95)
+            if "vox" in key or "vocal" in key:
+                add("vocals_bus", 0.95)
+            if "key" in key or "synth" in key or "piano" in key:
+                add("keys_bus", 0.9)
+            if not any(role.endswith("_bus") for role in roles):
+                add("submix_bus", 0.55)
+
+    if scope == "return":
+        if "reverb" in key or "verb" in key:
+            add("main_reverb", 0.95)
+        if "delay" in key or "echo" in key:
+            add("main_delay", 0.95)
+        if ("parallel" in key or "ny" in key) and ("comp" in key or "compress" in key):
+            add("parallel_compression", 0.97)
+        elif "comp" in key or "compress" in key:
+            add("compression_return", 0.75)
+        if "dist" in key or "satur" in key:
+            add("distortion_return", 0.7)
+
+    if scope == "master":
+        add("mix_bus", 0.99)
+    return roles, confidence
+
+
+def _topology_row_id(scope: str, row: Dict[str, Any]) -> str:
+    """Build stable ID for topology rows."""
+    if scope == "master":
+        return "master"
+    index_value = _safe_int_value(row.get("index"))
+    if index_value is None:
+        return f"{scope}:unknown"
+    return f"{scope}:{index_value}"
+
+
+def _stage_status(has_all: bool, has_partial: bool) -> str:
+    """Return stage status enum."""
+    if has_all:
+        return "sufficient"
+    if has_partial:
+        return "partial"
+    return "missing"
+
+
+def _collect_device_parameters_for_track(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    page_size: int = 256
+) -> Dict[str, Any]:
+    """Fetch all paged device parameters including automation state."""
+    first_page = get_device_parameters(ctx, track_index=track_index, device_index=device_index, offset=0, limit=page_size)
+    if not isinstance(first_page, dict):
+        return {"ok": False, "error": "invalid_response", "parameters": []}
+    if first_page.get("ok") is False:
+        return first_page
+
+    total_parameters = _safe_int_value(first_page.get("total_parameters"))
+    if total_parameters is None:
+        total_parameters = len(first_page.get("parameters", [])) if isinstance(first_page.get("parameters"), list) else 0
+
+    params_out: List[Dict[str, Any]] = []
+    if isinstance(first_page.get("parameters"), list):
+        params_out.extend([row for row in first_page["parameters"] if isinstance(row, dict)])
+
+    next_offset = len(params_out)
+    while next_offset < total_parameters:
+        page = get_device_parameters(ctx, track_index=track_index, device_index=device_index, offset=next_offset, limit=page_size)
+        if not isinstance(page, dict) or page.get("ok") is False:
+            break
+        rows = page.get("parameters", [])
+        if not isinstance(rows, list) or not rows:
+            break
+        params_out.extend([row for row in rows if isinstance(row, dict)])
+        next_offset += len(rows)
+
+    # Deduplicate by parameter_index
+    by_index: Dict[int, Dict[str, Any]] = {}
+    for row in params_out:
+        parameter_index = _safe_int_value(row.get("parameter_index"))
+        if parameter_index is None:
+            continue
+        by_index[parameter_index] = row
+
+    return {
+        "ok": True,
+        "track_index": track_index,
+        "device_index": device_index,
+        "parameters": [by_index[idx] for idx in sorted(by_index.keys())],
+        "parameter_count": len(by_index)
+    }
+
+
 # Core Tool endpoints
 
 @mcp.tool()
@@ -2973,6 +3857,153 @@ def get_detail_clip_source_path(ctx: Context) -> Dict[str, Any]:
 
 
 @mcp.tool()
+def get_mix_topology(
+    ctx: Context,
+    include_device_chains: bool = True,
+    include_device_parameters: bool = False
+) -> Dict[str, Any]:
+    """
+    Return normalized routing/bus/send topology for tracks, returns, and master.
+
+    Parameters:
+    - include_device_chains: include device-chain metadata for tracks/returns/master
+    - include_device_parameters: request full parameter payloads (best-effort; may be partial on older backends)
+    """
+    _ = ctx
+    try:
+        ableton = get_ableton_connection()
+        raw = ableton.send_command("get_mix_topology", {
+            "include_device_chains": bool(include_device_chains),
+            "include_device_parameters": bool(include_device_parameters)
+        })
+        normalized = _normalize_mix_topology_payload(raw)
+        if include_device_parameters:
+            warnings = list(normalized.get("warnings", []))
+            for scope_key in ("tracks", "returns"):
+                rows = normalized.get(scope_key, [])
+                if not isinstance(rows, list):
+                    continue
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    for device in row.get("devices", []):
+                        if not isinstance(device, dict):
+                            continue
+                        if "parameters" not in device:
+                            device["parameters"] = []
+                    # If the backend provided no inline parameter payloads, note that once.
+                if rows and all(
+                    isinstance(row, dict)
+                    and isinstance(row.get("devices"), list)
+                    and all(isinstance(dev, dict) and isinstance(dev.get("parameters"), list) and len(dev["parameters"]) == 0 for dev in row["devices"])
+                    for row in rows
+                ):
+                    warnings.append(f"{scope_key}_device_parameters_unavailable_or_empty")
+            master_row = normalized.get("master")
+            if isinstance(master_row, dict):
+                for device in master_row.get("devices", []):
+                    if isinstance(device, dict) and "parameters" not in device:
+                        device["parameters"] = []
+            normalized["warnings"] = warnings
+        return normalized
+    except Exception as e:
+        logger.error(f"Error getting mix topology: {str(e)}")
+        return {
+            "ok": False,
+            "error": "get_mix_topology_failed",
+            "message": str(e),
+            "session": {},
+            "tracks": [],
+            "returns": [],
+            "master": None,
+            "edges": [],
+            "warnings": []
+        }
+
+
+@mcp.tool()
+def get_send_matrix(ctx: Context) -> Dict[str, Any]:
+    """Return a compact send matrix derived from get_mix_topology."""
+    topology = get_mix_topology(ctx, include_device_chains=False, include_device_parameters=False)
+    if not isinstance(topology, dict):
+        return {
+            "ok": False,
+            "error": "invalid_topology_response",
+            "message": "get_mix_topology returned invalid payload",
+            "rows": [],
+            "active_routes": []
+        }
+    if topology.get("ok") is not True:
+        return topology
+    return _derive_send_matrix_from_topology(topology)
+
+
+@mcp.tool()
+def get_return_tracks_info(ctx: Context, include_device_chains: bool = True) -> Dict[str, Any]:
+    """
+    Return return-track mixer/routing/device-chain metadata.
+
+    Parameters:
+    - include_device_chains: include return-track device chains
+    """
+    topology = get_mix_topology(
+        ctx,
+        include_device_chains=bool(include_device_chains),
+        include_device_parameters=False
+    )
+    if not isinstance(topology, dict):
+        return {
+            "ok": False,
+            "error": "invalid_topology_response",
+            "message": "get_mix_topology returned invalid payload",
+            "returns": []
+        }
+    if topology.get("ok") is not True:
+        return topology
+    returns = topology.get("returns", [])
+    return {
+        "ok": True,
+        "return_count": len(returns) if isinstance(returns, list) else 0,
+        "returns": returns if isinstance(returns, list) else [],
+        "warnings": topology.get("warnings", [])
+    }
+
+
+@mcp.tool()
+def get_master_track_device_chain(ctx: Context) -> Dict[str, Any]:
+    """Return master-track device-chain metadata and mixer state."""
+    topology = get_mix_topology(ctx, include_device_chains=True, include_device_parameters=False)
+    if not isinstance(topology, dict):
+        return {
+            "ok": False,
+            "error": "invalid_topology_response",
+            "message": "get_mix_topology returned invalid payload"
+        }
+    if topology.get("ok") is not True:
+        return topology
+
+    master = topology.get("master")
+    if not isinstance(master, dict):
+        return {
+            "ok": False,
+            "error": "master_unavailable",
+            "message": "Master track topology was not available",
+            "warnings": topology.get("warnings", [])
+        }
+
+    devices = master.get("devices", [])
+    return {
+        "ok": True,
+        "scope": "master",
+        "track_name": master.get("name") or "Master",
+        "mixer": master.get("mixer", {}),
+        "device_count": len(devices) if isinstance(devices, list) else 0,
+        "devices": devices if isinstance(devices, list) else [],
+        "warnings": topology.get("warnings", [])
+    }
+
+
+@mcp.tool()
 def get_track_device_chain(ctx: Context, track_index: int) -> Dict[str, Any]:
     """
     Get ordered device chain metadata for a track.
@@ -3078,7 +4109,6 @@ def get_device_parameters(
             "offset": offset_value,
             "limit": limit_value
         }
-
 
 @mcp.tool()
 def snapshot_device_parameters(ctx: Context, track_index: int, device_index: int) -> Dict[str, Any]:
@@ -4791,6 +5821,61 @@ def analyze_audio_file(
 
 
 @mcp.tool()
+def analyze_mastering_file(
+    ctx: Context,
+    file_path: str,
+    window_sec: float = 1.0
+) -> Dict[str, Any]:
+    """
+    Analyze a file with mastering-oriented loudness, peak, stereo, and spectral metrics.
+
+    Parameters:
+    - file_path: absolute or launch-cwd-relative path to WAV/MP3/AIF/FLAC/M4A file
+    - window_sec: timeline hop/window size used for correlation and loudness series sampling
+    """
+    _ = ctx
+    try:
+        normalized_path = _normalize_source_path(file_path)
+        file_exists, stat_size, stat_mtime = _safe_file_stats(normalized_path)
+        if not file_exists:
+            return {
+                "ok": False,
+                "error": "file_not_found",
+                "message": "Audio file does not exist",
+                "file_path": normalized_path
+            }
+        if stat_size is None or stat_mtime is None:
+            return {
+                "ok": False,
+                "error": "stat_failed",
+                "message": "Could not read file metadata",
+                "file_path": normalized_path
+            }
+
+        return _analyze_mastering_source(
+            file_path=normalized_path,
+            stat_size=int(stat_size),
+            stat_mtime=float(stat_mtime),
+            window_sec=float(window_sec)
+        )
+    except SourceAnalysisError as exc:
+        return {
+            "ok": False,
+            "error": exc.code,
+            "message": exc.message,
+            "file_path": _normalize_source_path(file_path)
+        }
+    except Exception as exc:
+        logger.error(f"Error analyzing mastering file '{file_path}': {str(exc)}")
+        return {
+            "ok": False,
+            "error": "analyze_mastering_file_failed",
+            "message": str(exc),
+            "file_path": _normalize_source_path(file_path)
+        }
+
+
+@mcp.tool()
 def scan_audio_presence_from_file(
     ctx: Context,
     wav_path: str,
@@ -5247,12 +6332,24 @@ def analyze_export_job(
     manifest_path: Optional[str] = None,
     job_name: Optional[str] = None,
     window_sec: float = _DEFAULT_AUDIO_WINDOW_SEC,
-    rms_threshold_db: float = _DEFAULT_RMS_THRESHOLD_DBFS
+    rms_threshold_db: float = _DEFAULT_RMS_THRESHOLD_DBFS,
+    analysis_profile: str = "mix"
 ) -> Dict[str, Any]:
     """
     Analyze all exported WAVs in a manifest. Returns WAIT_FOR_USER_EXPORT if missing.
+
+    Parameters:
+    - analysis_profile: "mix" (default) or "mastering"
     """
     try:
+        profile = str(analysis_profile or "mix").strip().lower()
+        if profile not in {"mix", "mastering"}:
+            return {
+                "ok": False,
+                "error": "invalid_analysis_profile",
+                "message": "analysis_profile must be 'mix' or 'mastering'"
+            }
+
         readiness = check_exports_ready(ctx=ctx, manifest_path=manifest_path, job_name=job_name)
         if not isinstance(readiness, dict):
             return {
@@ -5288,6 +6385,12 @@ def analyze_export_job(
         results = []
         peak_values = []
         rms_values = []
+        lufs_values = []
+        true_peak_values = []
+        correlation_min_values = []
+        items_exceeding_true_peak_threshold: List[str] = []
+        items_below_target_loudness: List[str] = []
+        items_above_target_loudness: List[str] = []
         notes = []
 
         for index, item in enumerate(items):
@@ -5304,13 +6407,20 @@ def analyze_export_job(
                 notes.append(f"{item_id}:missing_wav_path")
                 continue
 
-            analysis = analyze_audio_file(
-                ctx=ctx,
-                wav_path=wav_path,
-                window_sec=window_sec,
-                rms_threshold_db=rms_threshold_db,
-                auto_trim_silence=True
-            )
+            if profile == "mastering":
+                analysis = analyze_mastering_file(
+                    ctx=ctx,
+                    file_path=wav_path,
+                    window_sec=window_sec
+                )
+            else:
+                analysis = analyze_audio_file(
+                    ctx=ctx,
+                    wav_path=wav_path,
+                    window_sec=window_sec,
+                    rms_threshold_db=rms_threshold_db,
+                    auto_trim_silence=True
+                )
 
             analysis_file_name = (
                 f"{job_token}__{_sanitize_filename_token(item_id, fallback='item')}"
@@ -5322,21 +6432,52 @@ def analyze_export_job(
             entry = {
                 "item_id": item_id,
                 "wav_path": _normalize_source_path(wav_path),
-                "analysis_json_path": analysis_json_path
+                "analysis_json_path": analysis_json_path,
+                "analysis_profile": profile
             }
 
             if isinstance(analysis, dict) and analysis.get("ok"):
-                entry["detected_audio"] = bool(analysis.get("detected_audio"))
-                entry["first_signal_time_sec"] = analysis.get("first_signal_time_sec")
-                entry["metrics"] = analysis.get("metrics")
-                metrics = analysis.get("metrics", {})
-                if isinstance(metrics, dict):
-                    peak_db = metrics.get("overall_peak_dbfs")
-                    rms_db = metrics.get("overall_rms_dbfs")
+                if profile == "mastering":
+                    entry["detected_audio"] = True
+                    entry["mastering"] = {
+                        "lufs_integrated": analysis.get("lufs_integrated"),
+                        "true_peak_dbtp": analysis.get("true_peak_dbtp"),
+                        "sample_peak_dbfs": analysis.get("sample_peak_dbfs"),
+                        "correlation_min": analysis.get("correlation_min"),
+                        "stereo_width_score": analysis.get("stereo_width_score"),
+                        "inter_sample_peak_risk": analysis.get("inter_sample_peak_risk"),
+                        "summary": analysis.get("summary")
+                    }
+                    peak_db = analysis.get("sample_peak_dbfs")
                     if isinstance(peak_db, (int, float)):
                         peak_values.append(float(peak_db))
-                    if isinstance(rms_db, (int, float)):
-                        rms_values.append(float(rms_db))
+                    lufs_value = analysis.get("lufs_integrated")
+                    if isinstance(lufs_value, (int, float)):
+                        lufs_values.append(float(lufs_value))
+                        if float(lufs_value) < float(_DEFAULT_MASTERING_TARGET_LUFS):
+                            items_below_target_loudness.append(item_id)
+                        elif float(lufs_value) > float(_DEFAULT_MASTERING_TARGET_LUFS):
+                            items_above_target_loudness.append(item_id)
+                    true_peak = analysis.get("true_peak_dbtp")
+                    if isinstance(true_peak, (int, float)):
+                        true_peak_values.append(float(true_peak))
+                    corr_min = analysis.get("correlation_min")
+                    if isinstance(corr_min, (int, float)):
+                        correlation_min_values.append(float(corr_min))
+                    if analysis.get("inter_sample_peak_risk") is True:
+                        items_exceeding_true_peak_threshold.append(item_id)
+                else:
+                    entry["detected_audio"] = bool(analysis.get("detected_audio"))
+                    entry["first_signal_time_sec"] = analysis.get("first_signal_time_sec")
+                    entry["metrics"] = analysis.get("metrics")
+                    metrics = analysis.get("metrics", {})
+                    if isinstance(metrics, dict):
+                        peak_db = metrics.get("overall_peak_dbfs")
+                        rms_db = metrics.get("overall_rms_dbfs")
+                        if isinstance(peak_db, (int, float)):
+                            peak_values.append(float(peak_db))
+                        if isinstance(rms_db, (int, float)):
+                            rms_values.append(float(rms_db))
             else:
                 entry["detected_audio"] = False
                 entry["first_signal_time_sec"] = None
@@ -5352,8 +6493,23 @@ def analyze_export_job(
             "any_missing": False,
             "loudest_peak_dbfs": max(peak_values) if peak_values else None,
             "average_rms_dbfs": (sum(rms_values) / len(rms_values)) if rms_values else None,
+            "analysis_profile": profile,
             "notes": notes
         }
+        if profile == "mastering":
+            summary["target_lufs"] = _DEFAULT_MASTERING_TARGET_LUFS
+            summary["lufs_integrated_range"] = (
+                {
+                    "min": min(lufs_values),
+                    "max": max(lufs_values)
+                }
+                if lufs_values else None
+            )
+            summary["true_peak_max_dbtp"] = max(true_peak_values) if true_peak_values else None
+            summary["correlation_min"] = min(correlation_min_values) if correlation_min_values else None
+            summary["items_exceeding_true_peak_threshold"] = items_exceeding_true_peak_threshold
+            summary["items_below_target_loudness"] = items_below_target_loudness
+            summary["items_above_target_loudness"] = items_above_target_loudness
 
         return {
             "ok": True,
@@ -5854,6 +7010,1010 @@ def index_sources_from_live_set(ctx: Context, track_indices: Optional[List[int]]
             "error": "index_failed",
             "message": str(e)
         }
+
+
+def _automation_state_is_active(value: Any) -> Optional[bool]:
+    """Best-effort normalization of parameter automation_state values."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, (int, float)):
+        try:
+            return int(value) != 0
+        except Exception:
+            return None
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if not lowered:
+            return None
+        if lowered in {"0", "none", "off", "disabled", "not_automated", "no_automation"}:
+            return False
+        return True
+    return None
+
+
+def _build_mix_stage_readiness(
+    topology: Optional[Dict[str, Any]],
+    tags_profile: Optional[Dict[str, Any]],
+    automation_overview: Optional[Dict[str, Any]],
+    source_inventory: Optional[Dict[str, Any]],
+    export_analysis: Optional[Dict[str, Any]],
+    include_mastering_metrics: bool
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Build deterministic stage-readiness rows and missing-data actions."""
+    topology_ok = isinstance(topology, dict) and topology.get("ok") is True
+    tags_ok = isinstance(tags_profile, dict) and tags_profile.get("ok") is True
+    automation_ok = isinstance(automation_overview, dict) and automation_overview.get("ok") is True
+    source_ok = isinstance(source_inventory, dict) and source_inventory.get("ok") is True
+    export_ok = isinstance(export_analysis, dict) and export_analysis.get("ok") is True
+    export_ready = export_ok and export_analysis.get("ready", True) is not False
+    export_profile = export_analysis.get("summary", {}).get("analysis_profile") if isinstance(export_analysis, dict) and isinstance(export_analysis.get("summary"), dict) else None
+
+    group_bus_visible = False
+    sends_visible = False
+    return_visible = False
+    master_chain_visible = False
+    if topology_ok:
+        track_rows = topology.get("tracks", [])
+        return_rows = topology.get("returns", [])
+        if isinstance(track_rows, list):
+            group_bus_visible = any(bool(row.get("is_group_track")) for row in track_rows if isinstance(row, dict))
+            sends_visible = any(isinstance(row.get("sends"), list) and len(row.get("sends")) > 0 for row in track_rows if isinstance(row, dict))
+        if isinstance(return_rows, list):
+            return_visible = len(return_rows) >= 0
+        master = topology.get("master")
+        master_chain_visible = isinstance(master, dict) and isinstance(master.get("devices"), list)
+
+    automation_supported = False
+    if automation_ok:
+        automation_supported = bool(automation_overview.get("supported")) or bool(automation_overview.get("tracks_with_device_automation", 0))
+
+    stages: List[Dict[str, Any]] = []
+    actions: List[Dict[str, Any]] = []
+
+    def add_stage(stage_id: str, has_all: bool, has_partial: bool, data_present: List[str], data_missing: List[str], recommended_next_steps: List[str]) -> None:
+        stages.append({
+            "stage": stage_id,
+            "status": _stage_status(has_all=has_all, has_partial=has_partial),
+            "data_present": data_present,
+            "data_missing": data_missing,
+            "recommended_next_steps": recommended_next_steps
+        })
+
+    add_stage(
+        "mix_session_prep_inserts_sends",
+        has_all=bool(topology_ok and sends_visible and return_visible and master_chain_visible),
+        has_partial=bool(topology_ok),
+        data_present=[x for x in [
+            "mix_topology" if topology_ok else None,
+            "send_matrix" if topology_ok and sends_visible else None,
+            "return_track_chains" if topology_ok and return_visible else None,
+            "master_chain" if topology_ok and master_chain_visible else None
+        ] if x],
+        data_missing=[x for x in [
+            None if topology_ok else "mix_topology",
+            None if sends_visible else "send_levels_or_send_slots",
+            None if return_visible else "return_track_visibility",
+            None if master_chain_visible else "master_track_device_chain"
+        ] if x],
+        recommended_next_steps=[x for x in [
+            "Call get_mix_topology to inspect sends, returns, and master routing." if not topology_ok else None,
+            "Call get_send_matrix for a compact send routing view." if topology_ok else None
+        ] if x]
+    )
+
+    add_stage(
+        "mix_stage_1_import_organize",
+        has_all=bool(tags_ok and topology_ok and source_ok),
+        has_partial=bool(topology_ok or source_ok),
+        data_present=[x for x in [
+            "track_topology" if topology_ok else None,
+            "mix_context_tags" if tags_ok else None,
+            "source_inventory" if source_ok else None
+        ] if x],
+        data_missing=[x for x in [
+            None if topology_ok else "track_topology",
+            None if tags_ok else "semantic_track_roles",
+            None if source_ok else "source_inventory"
+        ] if x],
+        recommended_next_steps=[x for x in [
+            "Call build_mix_context_profile to merge inferred and explicit track roles." if not tags_ok else None,
+            "Call index_sources_from_live_set to analyze source clips." if not source_ok else None
+        ] if x]
+    )
+
+    add_stage(
+        "mix_stage_2_gain_staging",
+        has_all=bool(source_ok and export_ok and export_ready),
+        has_partial=bool(source_ok or export_ok),
+        data_present=[x for x in [
+            "source_spectral_loudness_summaries" if source_ok else None,
+            "export_analysis_mix_metrics" if export_ok and export_profile == "mix" else None
+        ] if x],
+        data_missing=[x for x in [
+            "real_time_metering" if True else None,
+            None if (export_ok and export_profile == "mix") else "exported_mix_loudness_windows"
+        ] if x],
+        recommended_next_steps=[x for x in [
+            "Use plan_exports -> check_exports_ready -> analyze_export_job for exported stems/mix windows." if not export_ok else None
+        ] if x]
+    )
+
+    add_stage(
+        "mix_stage_3_fader_mix",
+        has_all=bool(topology_ok and tags_ok),
+        has_partial=bool(topology_ok),
+        data_present=[x for x in [
+            "topology" if topology_ok else None,
+            "semantic_roles" if tags_ok else None,
+            "send_matrix" if topology_ok and sends_visible else None
+        ] if x],
+        data_missing=[x for x in [
+            None if topology_ok else "topology",
+            None if tags_ok else "semantic_roles"
+        ] if x],
+        recommended_next_steps=[x for x in [
+            "Save explicit mix context tags for lead vocal/core band tracks." if not tags_ok else None
+        ] if x]
+    )
+
+    add_stage(
+        "mix_stage_4_automation_pass",
+        has_all=False,
+        has_partial=bool(automation_ok),
+        data_present=[x for x in [
+            "device_parameter_automation_states" if automation_ok else None
+        ] if x],
+        data_missing=[x for x in [
+            "automation_envelope_points",
+            "track_volume_pan_automation_envelopes"
+        ] if x],
+        recommended_next_steps=[x for x in [
+            "Call get_automation_overview and get_track_automation_targets to inspect automation-state coverage." if not automation_ok else "Call get_automation_envelope_points for specific targets; use export-based loudness timelines as a proxy when envelope point access is unavailable."
+        ] if x]
+    )
+
+    add_stage(
+        "mix_stage_5_sub_mix",
+        has_all=bool(topology_ok and group_bus_visible and master_chain_visible),
+        has_partial=bool(topology_ok),
+        data_present=[x for x in [
+            "group_bus_membership" if topology_ok and group_bus_visible else None,
+            "return_tracks" if topology_ok else None,
+            "master_chain" if topology_ok and master_chain_visible else None
+        ] if x],
+        data_missing=[x for x in [
+            None if topology_ok else "mix_topology",
+            None if group_bus_visible else "group_track_submix_structure",
+            None if master_chain_visible else "master_chain"
+        ] if x],
+        recommended_next_steps=[x for x in [
+            "Inspect get_mix_topology edges to confirm submix bus membership and routing." if topology_ok else None
+        ] if x]
+    )
+
+    add_stage(
+        "mix_stage_6_printing_stereo_and_stems",
+        has_all=bool(export_ok and export_ready),
+        has_partial=True,
+        data_present=[x for x in [
+            "export_workflow_tools_available",
+            "export_analysis_results" if export_ok else None
+        ] if x],
+        data_missing=[x for x in [
+            None if export_ok else "analyzed_exports"
+        ] if x],
+        recommended_next_steps=[x for x in [
+            "Call plan_exports, export WAVs manually, then check_exports_ready and analyze_export_job." if not export_ok else None
+        ] if x]
+    )
+
+    mastering_export_ok = export_ok and export_profile == "mastering"
+    add_stage(
+        "mastering_goals",
+        has_all=bool(mastering_export_ok or (include_mastering_metrics and export_ok)),
+        has_partial=bool(topology_ok or source_ok or export_ok),
+        data_present=[x for x in [
+            "master_track_chain" if topology_ok and master_chain_visible else None,
+            "mastering_metrics" if mastering_export_ok else None
+        ] if x],
+        data_missing=[x for x in [
+            None if mastering_export_ok else "mastering_metrics_batch_or_single"
+        ] if x],
+        recommended_next_steps=[x for x in [
+            "Run analyze_mastering_file on a printed mix, or analyze_export_job(analysis_profile='mastering')." if not mastering_export_ok else None
+        ] if x]
+    )
+
+    add_stage(
+        "mastering_chain_eq_sat_comp_eq_stereo_limit",
+        has_all=bool(topology_ok and master_chain_visible and mastering_export_ok),
+        has_partial=bool(topology_ok or mastering_export_ok),
+        data_present=[x for x in [
+            "master_chain" if topology_ok and master_chain_visible else None,
+            "mastering_metrics" if mastering_export_ok else None
+        ] if x],
+        data_missing=[x for x in [
+            None if topology_ok and master_chain_visible else "master_chain_visibility",
+            None if mastering_export_ok else "true_peak_lufs_stereo_metrics"
+        ] if x],
+        recommended_next_steps=[x for x in [
+            "Use get_master_track_device_chain to inspect chain order and tools." if not (topology_ok and master_chain_visible) else None,
+            "Use analyze_export_job with analysis_profile='mastering' for printed mixes/stems." if not mastering_export_ok else None
+        ] if x]
+    )
+
+    if not topology_ok:
+        actions.append({
+            "kind": "tool_call",
+            "tool": "get_mix_topology",
+            "params": {"include_device_chains": True, "include_device_parameters": False},
+            "reason": "Need routing, sends, returns, and master chain visibility."
+        })
+    if not tags_ok:
+        actions.append({
+            "kind": "tool_call",
+            "tool": "build_mix_context_profile",
+            "params": {},
+            "reason": "Generate inferred semantic roles and merge with saved tags."
+        })
+    if not automation_ok:
+        actions.append({
+            "kind": "tool_call",
+            "tool": "get_automation_overview",
+            "params": {},
+            "reason": "Inspect automation-state coverage for track devices."
+        })
+    if not source_ok:
+        actions.append({
+            "kind": "tool_call",
+            "tool": "index_sources_from_live_set",
+            "params": {},
+            "reason": "Analyze source clip files for spectral/loudness summaries."
+        })
+    if not export_ok:
+        actions.append({
+            "kind": "workflow",
+            "tool": "plan_exports",
+            "params": {"job_name": "mix_or_master_prints", "items": [{"target": "mix", "start_bar": 1, "end_bar": 9}]},
+            "reason": "Export-based ears workflow is required for print/stem analysis."
+        })
+
+    return stages, actions
+
+
+@mcp.tool()
+def infer_mix_context_tags(ctx: Context) -> Dict[str, Any]:
+    """
+    Infer semantic mix-role tags from topology names (tracks, returns, master).
+    Returns confidence scores but does not persist anything.
+    """
+    topology = get_mix_topology(ctx, include_device_chains=False, include_device_parameters=False)
+    if not isinstance(topology, dict):
+        return {
+            "ok": False,
+            "error": "invalid_topology_response",
+            "message": "get_mix_topology returned invalid payload"
+        }
+    if topology.get("ok") is not True:
+        return topology
+
+    track_roles: Dict[str, List[str]] = {}
+    return_roles: Dict[str, List[str]] = {}
+    master_roles: List[str] = []
+    confidence: Dict[str, Dict[str, float]] = {}
+    reasons: Dict[str, List[Dict[str, Any]]] = {}
+
+    for row in topology.get("tracks", []):
+        if not isinstance(row, dict):
+            continue
+        item_id = _topology_row_id("track", row)
+        roles, scores = _infer_roles_from_name(
+            name=str(row.get("name") or ""),
+            scope="track",
+            is_group_track=bool(row.get("is_group_track"))
+        )
+        if roles:
+            track_roles[item_id] = roles
+            confidence[item_id] = {role: round(float(scores.get(role, 0.0)), 4) for role in roles}
+            reasons[item_id] = [{
+                "role": role,
+                "confidence": round(float(scores.get(role, 0.0)), 4),
+                "basis": "name_heuristic"
+            } for role in roles]
+
+    for row in topology.get("returns", []):
+        if not isinstance(row, dict):
+            continue
+        item_id = _topology_row_id("return", row)
+        roles, scores = _infer_roles_from_name(
+            name=str(row.get("name") or ""),
+            scope="return",
+            is_group_track=False
+        )
+        if roles:
+            return_roles[item_id] = roles
+            confidence[item_id] = {role: round(float(scores.get(role, 0.0)), 4) for role in roles}
+            reasons[item_id] = [{
+                "role": role,
+                "confidence": round(float(scores.get(role, 0.0)), 4),
+                "basis": "name_heuristic"
+            } for role in roles]
+
+    master_row = topology.get("master")
+    if isinstance(master_row, dict):
+        roles, scores = _infer_roles_from_name(
+            name=str(master_row.get("name") or "Master"),
+            scope="master",
+            is_group_track=False
+        )
+        if roles:
+            master_roles = roles
+            confidence["master"] = {role: round(float(scores.get(role, 0.0)), 4) for role in roles}
+            reasons["master"] = [{
+                "role": role,
+                "confidence": round(float(scores.get(role, 0.0)), 4),
+                "basis": "default_master_role"
+            } for role in roles]
+
+    return {
+        "ok": True,
+        "schema_version": _MIX_CONTEXT_TAGS_SCHEMA_VERSION,
+        "inferred_at": _utc_now_iso(),
+        "track_roles": track_roles,
+        "return_roles": return_roles,
+        "master_roles": master_roles,
+        "confidence": confidence,
+        "suggestions": reasons,
+        "metadata": {
+            "source": "inference",
+            "inference_version": 1
+        },
+        "warnings": topology.get("warnings", [])
+    }
+
+
+@mcp.tool()
+def get_mix_context_tags(ctx: Context) -> Dict[str, Any]:
+    """Load persisted mix-context semantic tags from the project analysis folder."""
+    _ = ctx
+    return _load_mix_context_tags_payload()
+
+
+@mcp.tool()
+def save_mix_context_tags(ctx: Context, tags: Dict[str, Any], merge: bool = True) -> Dict[str, Any]:
+    """
+    Persist mix-context semantic tags to the project analysis folder.
+
+    Parameters:
+    - tags: payload with track_roles / return_roles / master_roles
+    - merge: when true, preserve existing explicit tags and merge in new keys
+    """
+    _ = ctx
+    incoming = _normalize_mix_context_tags_input(tags)
+    if not merge:
+        incoming["metadata"]["source"] = "manual"
+        return _write_mix_context_tags_payload(incoming)
+
+    existing = _load_mix_context_tags_payload()
+    merged = _empty_mix_context_tags_payload()
+    merged["track_roles"] = _merge_role_maps_prefer_explicit(
+        explicit_map=existing.get("track_roles", {}),
+        inferred_map=incoming.get("track_roles", {})
+    )
+    merged["return_roles"] = _merge_role_maps_prefer_explicit(
+        explicit_map=existing.get("return_roles", {}),
+        inferred_map=incoming.get("return_roles", {})
+    )
+    merged["master_roles"] = (
+        existing.get("master_roles")
+        if isinstance(existing.get("master_roles"), list) and existing.get("master_roles")
+        else incoming.get("master_roles", [])
+    )
+    merged["metadata"] = {
+        "source": "manual",
+        "inference_version": 1
+    }
+    return _write_mix_context_tags_payload(merged)
+
+
+@mcp.tool()
+def build_mix_context_profile(ctx: Context) -> Dict[str, Any]:
+    """Build merged topology + explicit tags + inferred suggestions profile."""
+    topology = get_mix_topology(ctx, include_device_chains=False, include_device_parameters=False)
+    if not isinstance(topology, dict):
+        return {
+            "ok": False,
+            "error": "invalid_topology_response",
+            "message": "get_mix_topology returned invalid payload"
+        }
+    if topology.get("ok") is not True:
+        return topology
+
+    explicit = get_mix_context_tags(ctx)
+    inferred = infer_mix_context_tags(ctx)
+
+    explicit_track_roles = explicit.get("track_roles", {}) if isinstance(explicit, dict) else {}
+    explicit_return_roles = explicit.get("return_roles", {}) if isinstance(explicit, dict) else {}
+    explicit_master_roles = explicit.get("master_roles", []) if isinstance(explicit, dict) else []
+    inferred_track_roles = inferred.get("track_roles", {}) if isinstance(inferred, dict) else {}
+    inferred_return_roles = inferred.get("return_roles", {}) if isinstance(inferred, dict) else {}
+    inferred_master_roles = inferred.get("master_roles", []) if isinstance(inferred, dict) else []
+
+    merged_track_roles = _merge_role_maps_prefer_explicit(
+        explicit_map=explicit_track_roles if isinstance(explicit_track_roles, dict) else {},
+        inferred_map=inferred_track_roles if isinstance(inferred_track_roles, dict) else {}
+    )
+    merged_return_roles = _merge_role_maps_prefer_explicit(
+        explicit_map=explicit_return_roles if isinstance(explicit_return_roles, dict) else {},
+        inferred_map=inferred_return_roles if isinstance(inferred_return_roles, dict) else {}
+    )
+    merged_master_roles = (
+        explicit_master_roles if isinstance(explicit_master_roles, list) and explicit_master_roles else (
+            inferred_master_roles if isinstance(inferred_master_roles, list) else []
+        )
+    )
+
+    return {
+        "ok": True,
+        "schema_version": _MIX_CONTEXT_TAGS_SCHEMA_VERSION,
+        "topology": topology,
+        "explicit_tags": explicit,
+        "inference_suggestions": inferred,
+        "merged_roles": {
+            "track_roles": merged_track_roles,
+            "return_roles": merged_return_roles,
+            "master_roles": merged_master_roles
+        },
+        "metadata": {
+            "merge_strategy": "explicit_overrides_inference",
+            "inference_version": 1
+        }
+    }
+
+
+@mcp.tool()
+def get_track_automation_targets(ctx: Context, track_index: int) -> Dict[str, Any]:
+    """
+    Return track-level automation targets (track volume/pan support + device parameters with automation state).
+
+    Parameters:
+    - track_index: 0-based track index
+    """
+    track_payload, track_error = _coerce_json_dict(get_track_info(ctx, track_index))
+    if track_payload is None:
+        return {
+            "ok": False,
+            "error": "track_info_unavailable",
+            "message": track_error or "Failed to load track info",
+            "track_index": track_index
+        }
+
+    chain_payload = get_track_device_chain(ctx, track_index)
+    if not isinstance(chain_payload, dict) or chain_payload.get("ok") is False:
+        return {
+            "ok": False,
+            "error": "track_device_chain_unavailable",
+            "message": (
+                chain_payload.get("message") if isinstance(chain_payload, dict) else "Invalid device chain response"
+            ),
+            "track_index": track_index
+        }
+
+    devices = chain_payload.get("devices", [])
+    if not isinstance(devices, list):
+        devices = []
+
+    device_rows = []
+    automated_device_count = 0
+    automated_parameter_count = 0
+    warnings: List[str] = []
+
+    for device in devices:
+        if not isinstance(device, dict):
+            continue
+        device_index = _safe_int_value(device.get("device_index"))
+        if device_index is None:
+            continue
+        params_payload = _collect_device_parameters_for_track(ctx, track_index=track_index, device_index=device_index)
+        parameters = params_payload.get("parameters", []) if isinstance(params_payload, dict) else []
+        if not isinstance(parameters, list):
+            parameters = []
+        if isinstance(params_payload, dict) and params_payload.get("ok") is False:
+            warnings.append(f"device_param_fetch_failed:{track_index}:{device_index}")
+
+        parameter_rows = []
+        device_has_automation = False
+        for row in parameters:
+            if not isinstance(row, dict):
+                continue
+            automation_state = row.get("automation_state")
+            automated = _automation_state_is_active(automation_state)
+            if automated is True:
+                device_has_automation = True
+                automated_parameter_count += 1
+            parameter_rows.append({
+                "parameter_index": row.get("parameter_index"),
+                "name": row.get("name"),
+                "automation_state": automation_state,
+                "automated": automated
+            })
+
+        if device_has_automation:
+            automated_device_count += 1
+
+        device_rows.append({
+            "device_index": device_index,
+            "device_name": device.get("name"),
+            "class_name": device.get("class_name"),
+            "parameter_count": len(parameter_rows),
+            "automated_parameter_count": sum(1 for p in parameter_rows if p.get("automated") is True),
+            "has_automation": device_has_automation,
+            "parameters": parameter_rows
+        })
+
+    # Track volume/pan automation envelopes are not exposed yet; keep explicit and stable.
+    track_mixer_targets = {
+        "volume": {
+            "supported": False,
+            "automation_state": None,
+            "automated": None,
+            "reason": "track_mixer_automation_state_not_exposed"
+        },
+        "panning": {
+            "supported": False,
+            "automation_state": None,
+            "automated": None,
+            "reason": "track_mixer_automation_state_not_exposed"
+        }
+    }
+
+    return {
+        "ok": True,
+        "track_index": track_index,
+        "track_name": track_payload.get("name"),
+        "supported": True,
+        "track_mixer_targets": track_mixer_targets,
+        "devices": device_rows,
+        "summary": {
+            "device_count": len(device_rows),
+            "devices_with_automation": automated_device_count,
+            "automated_parameter_count": automated_parameter_count
+        },
+        "warnings": warnings
+    }
+
+
+@mcp.tool()
+def get_automation_envelope_points(
+    ctx: Context,
+    track_index: int,
+    scope: str = "track_mixer",
+    mixer_target: str = "volume",
+    send_index: Optional[int] = None,
+    device_index: Optional[int] = None,
+    parameter_index: Optional[int] = None,
+    start_time_beats: Optional[float] = None,
+    end_time_beats: Optional[float] = None,
+    sample_points: int = 0
+) -> Dict[str, Any]:
+    """
+    Return automation envelope points (best effort) for a track mixer target or device parameter.
+
+    Parameters:
+    - track_index: 0-based normal track index
+    - scope: "track_mixer" or "device_parameter"
+    - mixer_target: for track_mixer scope: "volume", "panning", or "send"
+    - send_index: required when scope="track_mixer" and mixer_target="send"
+    - device_index: required when scope="device_parameter"
+    - parameter_index: required when scope="device_parameter"
+    - start_time_beats/end_time_beats: optional sampling range when point access is unavailable
+    - sample_points: optional sampled fallback count via envelope.value_at_time
+    """
+    _ = ctx
+
+    track_index_value = _safe_int_value(track_index)
+    if track_index_value is None or track_index_value < 0:
+        return {
+            "ok": False,
+            "error": "invalid_track_index",
+            "message": "track_index must be a non-negative integer",
+            "track_index": track_index
+        }
+
+    scope_value = (_safe_text_value(scope) or "track_mixer").lower()
+    mixer_target_value = (_safe_text_value(mixer_target) or "volume").lower()
+
+    if scope_value not in {"track_mixer", "device_parameter"}:
+        return {
+            "ok": False,
+            "error": "invalid_scope",
+            "message": "scope must be 'track_mixer' or 'device_parameter'",
+            "track_index": track_index_value,
+            "scope": scope
+        }
+
+    if scope_value == "track_mixer" and mixer_target_value not in {"volume", "panning", "send"}:
+        return {
+            "ok": False,
+            "error": "invalid_mixer_target",
+            "message": "mixer_target must be one of: volume, panning, send",
+            "track_index": track_index_value,
+            "scope": scope_value,
+            "mixer_target": mixer_target
+        }
+
+    if scope_value == "track_mixer" and mixer_target_value == "send":
+        send_index_value = _safe_int_value(send_index)
+        if send_index_value is None or send_index_value < 0:
+            return {
+                "ok": False,
+                "error": "invalid_send_index",
+                "message": "send_index must be a non-negative integer for mixer_target='send'",
+                "track_index": track_index_value,
+                "scope": scope_value,
+                "mixer_target": mixer_target_value,
+                "send_index": send_index
+            }
+
+    if scope_value == "device_parameter":
+        device_index_value = _safe_int_value(device_index)
+        parameter_index_value = _safe_int_value(parameter_index)
+        if device_index_value is None or device_index_value < 0:
+            return {
+                "ok": False,
+                "error": "invalid_device_index",
+                "message": "device_index must be a non-negative integer for scope='device_parameter'",
+                "track_index": track_index_value,
+                "scope": scope_value,
+                "device_index": device_index
+            }
+        if parameter_index_value is None or parameter_index_value < 0:
+            return {
+                "ok": False,
+                "error": "invalid_parameter_index",
+                "message": "parameter_index must be a non-negative integer for scope='device_parameter'",
+                "track_index": track_index_value,
+                "scope": scope_value,
+                "device_index": device_index_value,
+                "parameter_index": parameter_index
+            }
+
+    params: Dict[str, Any] = {
+        "track_index": track_index_value,
+        "scope": scope_value,
+        "mixer_target": mixer_target_value,
+        "sample_points": max(0, _safe_int_value(sample_points) or 0),
+    }
+    if send_index is not None:
+        params["send_index"] = _safe_int_value(send_index)
+    if device_index is not None:
+        params["device_index"] = _safe_int_value(device_index)
+    if parameter_index is not None:
+        params["parameter_index"] = _safe_int_value(parameter_index)
+    if start_time_beats is not None:
+        params["start_time_beats"] = _safe_float_value(start_time_beats)
+    if end_time_beats is not None:
+        params["end_time_beats"] = _safe_float_value(end_time_beats)
+
+    try:
+        ableton = get_ableton_connection()
+        raw = ableton.send_command("get_automation_envelope_points", params)
+    except Exception as e:
+        message = str(e)
+        if "Unknown command: get_automation_envelope_points" in message:
+            return {
+                "ok": True,
+                "supported": False,
+                "reason": "backend_command_unavailable",
+                "message": message,
+                "track_index": track_index_value,
+                "target": {
+                    "scope": scope_value,
+                    "mixer_target": mixer_target_value,
+                    "send_index": _safe_int_value(send_index),
+                    "device_index": _safe_int_value(device_index),
+                    "parameter_index": _safe_int_value(parameter_index),
+                },
+                "point_access_supported": False,
+                "envelope_exists": None,
+                "points": [],
+                "sampled_series": [],
+                "warnings": ["backend_command_unavailable"]
+            }
+        logger.error(f"Error getting automation envelope points: {message}")
+        return {
+            "ok": False,
+            "error": "get_automation_envelope_points_failed",
+            "message": message,
+            "track_index": track_index_value,
+            "target": {
+                "scope": scope_value,
+                "mixer_target": mixer_target_value,
+                "send_index": _safe_int_value(send_index),
+                "device_index": _safe_int_value(device_index),
+                "parameter_index": _safe_int_value(parameter_index),
+            }
+        }
+
+    payload, payload_error = _coerce_json_dict(raw)
+    if payload is None:
+        return {
+            "ok": False,
+            "error": "invalid_response",
+            "message": payload_error or "Backend returned invalid payload",
+            "track_index": track_index_value
+        }
+
+    result = dict(payload)
+    if "ok" not in result:
+        result["ok"] = True
+
+    # Normalize top-level booleans / lists for stability.
+    result["supported"] = bool(result.get("supported", False)) if "supported" in result else False
+    result["envelope_exists"] = result.get("envelope_exists")
+    result["point_access_supported"] = bool(result.get("point_access_supported", False)) if "point_access_supported" in result else False
+
+    if not isinstance(result.get("warnings"), list):
+        result["warnings"] = []
+
+    target_payload = result.get("target")
+    if not isinstance(target_payload, dict):
+        target_payload = {}
+    target_payload.setdefault("scope", scope_value)
+    if scope_value == "track_mixer":
+        target_payload.setdefault("mixer_target", mixer_target_value)
+    result["target"] = target_payload
+
+    def _normalize_point_rows(rows: Any, point_index_key: str = "point_index") -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        if not isinstance(rows, list):
+            return normalized
+        for idx, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            time_beats = _safe_float_value(row.get("time_beats"))
+            value = _safe_float_value(row.get("value"))
+            if time_beats is None:
+                time_beats = _safe_float_value(row.get("time"))
+            if value is None:
+                continue
+            point_index_value = _safe_int_value(row.get(point_index_key))
+            normalized_row = {
+                point_index_key: point_index_value if point_index_value is not None else idx,
+                "time_beats": time_beats,
+                "value": value,
+            }
+            shape_value = _safe_text_value(row.get("shape"))
+            if shape_value:
+                normalized_row["shape"] = shape_value
+            normalized.append(normalized_row)
+        normalized.sort(key=lambda row: (_safe_float_value(row.get("time_beats")) or 0.0, _safe_int_value(row.get(point_index_key)) or 0))
+        return normalized
+
+    result["points"] = _normalize_point_rows(result.get("points"), point_index_key="point_index")
+    result["sampled_series"] = _normalize_point_rows(result.get("sampled_series"), point_index_key="sample_index")
+
+    return result
+
+
+@mcp.tool()
+def get_automation_overview(ctx: Context, track_indices: Optional[List[int]] = None) -> Dict[str, Any]:
+    """
+    Return automation-state coverage overview for track devices (read-only; envelope points not included).
+
+    Parameters:
+    - track_indices: optional subset of normal tracks
+    """
+    session_payload, session_error = _coerce_json_dict(get_session_info(ctx))
+    if session_payload is None:
+        try:
+            ableton = get_ableton_connection()
+            session_direct = ableton.send_command("get_session_info")
+            if isinstance(session_direct, dict):
+                session_payload = session_direct
+        except Exception:
+            session_payload = None
+    if session_payload is None:
+        return {
+            "ok": False,
+            "error": "session_info_unavailable",
+            "message": session_error or "Failed to retrieve session info"
+        }
+
+    track_count = _safe_int_value(session_payload.get("track_count"))
+    indices_to_scan: List[int] = []
+    if track_indices is None:
+        if track_count is None:
+            return {
+                "ok": False,
+                "error": "track_count_missing",
+                "message": "track_count missing from session info"
+            }
+        indices_to_scan = list(range(max(0, track_count)))
+    else:
+        seen = set()
+        for value in track_indices:
+            idx = _safe_int_value(value)
+            if idx is None or idx < 0:
+                continue
+            if idx in seen:
+                continue
+            seen.add(idx)
+            indices_to_scan.append(idx)
+
+    tracks = []
+    tracks_with_device_automation = 0
+    total_automated_parameters = 0
+    warnings: List[str] = []
+
+    for track_index in indices_to_scan:
+        result = get_track_automation_targets(ctx, track_index)
+        if not isinstance(result, dict):
+            warnings.append(f"invalid_track_automation_result:{track_index}")
+            continue
+        if result.get("ok") is not True:
+            tracks.append({
+                "track_index": track_index,
+                "ok": False,
+                "error": result.get("error"),
+                "message": result.get("message")
+            })
+            continue
+
+        summary = result.get("summary", {})
+        if isinstance(summary, dict):
+            if int(summary.get("devices_with_automation", 0) or 0) > 0:
+                tracks_with_device_automation += 1
+            total_automated_parameters += int(summary.get("automated_parameter_count", 0) or 0)
+
+        tracks.append({
+            "track_index": track_index,
+            "track_name": result.get("track_name"),
+            "ok": True,
+            "devices_with_automation": summary.get("devices_with_automation"),
+            "automated_parameter_count": summary.get("automated_parameter_count"),
+            "track_mixer_targets": result.get("track_mixer_targets"),
+            "warnings": result.get("warnings", [])
+        })
+
+    return {
+        "ok": True,
+        "supported": True,
+        "envelope_points_supported": False,
+        "tracks_scanned": len(indices_to_scan),
+        "tracks_with_device_automation": tracks_with_device_automation,
+        "total_automated_parameters": total_automated_parameters,
+        "tracks": tracks,
+        "warnings": warnings,
+        "fallback_guidance": [
+            "Device parameter automation states are available in overview responses.",
+            "Call get_automation_envelope_points for specific mixer/device targets when you need point data, or use export-based loudness timelines as a proxy."
+        ]
+    }
+
+
+@mcp.tool()
+def build_mix_master_context(
+    ctx: Context,
+    profile: str = "full",
+    include_source_inventory: bool = True,
+    include_export_analysis: bool = False,
+    include_mastering_metrics: bool = False,
+    manifest_path: Optional[str] = None,
+    job_name: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Build a deterministic, LLM-ready mix/mastering context payload with stage-readiness statuses.
+
+    Parameters:
+    - profile: reserved profile selector (currently informational)
+    - include_source_inventory: include source clip inventory summaries
+    - include_export_analysis: include export-based analysis if manifest/job available
+    - include_mastering_metrics: when export analysis is requested, use mastering profile
+    - manifest_path/job_name: optional export-manifest selectors for export analysis
+    """
+    profile_value = _safe_text_value(profile) or "full"
+
+    mix_context_profile = build_mix_context_profile(ctx)
+    topology = mix_context_profile.get("topology") if isinstance(mix_context_profile, dict) else None
+
+    session_snapshot = get_session_snapshot(
+        ctx=ctx,
+        track_indices=None,
+        include_arrangement_clip_sources=False
+    )
+    automation_overview = get_automation_overview(ctx)
+
+    source_inventory = None
+    if include_source_inventory:
+        source_inventory = index_sources_from_live_set(ctx)
+
+    export_analysis = None
+    export_analysis_request = {
+        "enabled": bool(include_export_analysis),
+        "analysis_profile": "mastering" if include_mastering_metrics else "mix",
+        "manifest_path": manifest_path,
+        "job_name": job_name
+    }
+    if include_export_analysis:
+        if (isinstance(manifest_path, str) and manifest_path.strip()) or (isinstance(job_name, str) and job_name.strip()):
+            export_analysis = analyze_export_job(
+                ctx=ctx,
+                manifest_path=manifest_path,
+                job_name=job_name,
+                analysis_profile="mastering" if include_mastering_metrics else "mix"
+            )
+        else:
+            export_analysis = {
+                "ok": False,
+                "error": "missing_export_manifest_selector",
+                "message": "Provide manifest_path or job_name to include export analysis"
+            }
+
+    project_snapshot_summary = None
+    try:
+        snapshot = snapshot_project_state(ctx, include_device_hashes=False)
+        if isinstance(snapshot, dict) and snapshot.get("ok") is True:
+            project_snapshot_summary = {
+                "snapshot_id": snapshot.get("snapshot_id"),
+                "project_hash": snapshot.get("project_hash"),
+                "summary": snapshot.get("summary")
+            }
+        elif isinstance(snapshot, dict):
+            project_snapshot_summary = {
+                "ok": False,
+                "error": snapshot.get("error"),
+                "message": snapshot.get("message")
+            }
+    except Exception as exc:
+        project_snapshot_summary = {
+            "ok": False,
+            "error": "snapshot_project_state_failed",
+            "message": str(exc)
+        }
+
+    stages, missing_actions = _build_mix_stage_readiness(
+        topology=topology if isinstance(topology, dict) else None,
+        tags_profile=mix_context_profile if isinstance(mix_context_profile, dict) else None,
+        automation_overview=automation_overview if isinstance(automation_overview, dict) else None,
+        source_inventory=source_inventory if isinstance(source_inventory, dict) else None,
+        export_analysis=export_analysis if isinstance(export_analysis, dict) else None,
+        include_mastering_metrics=bool(include_mastering_metrics)
+    )
+
+    future_mutation_api_spec = {
+        "status": "planned_not_implemented",
+        "endpoints": [
+            "set_mixer_values(scope, index, volume?, panning?, mute?, solo?, arm?)",
+            "set_send_level(track_index, send_index, value)",
+            "set_device_parameter(scope, index, device_index, parameter_index, value)",
+            "load_effect_on_target(scope, index, uri)",
+            "set_track_output_routing(track_index, output_type, output_channel?)",
+            "apply_mix_template_sends(template_name|template_spec)"
+        ]
+    }
+
+    return {
+        "ok": True,
+        "profile": profile_value,
+        "topology": topology,
+        "tags": {
+            "explicit": mix_context_profile.get("explicit_tags") if isinstance(mix_context_profile, dict) else None,
+            "inference_suggestions": mix_context_profile.get("inference_suggestions") if isinstance(mix_context_profile, dict) else None,
+            "merged_roles": mix_context_profile.get("merged_roles") if isinstance(mix_context_profile, dict) else None
+        },
+        "session_snapshot": session_snapshot,
+        "project_snapshot_summary": project_snapshot_summary,
+        "automation_overview": automation_overview,
+        "source_inventory": source_inventory if include_source_inventory else None,
+        "export_analysis_request": export_analysis_request,
+        "export_analysis": export_analysis,
+        "stage_readiness": stages,
+        "missing_data_actions": missing_actions,
+        "future_mutation_api_spec": future_mutation_api_spec
+    }
 
 # Main execution
 def main():
