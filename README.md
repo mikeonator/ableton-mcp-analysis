@@ -140,7 +140,8 @@ This repo supports a file-based analysis workflow for reliable signal awareness 
 1. `plan_exports` to create a manifest and deterministic output paths.
 2. Export WAVs in Ableton to the suggested paths.
 3. `check_exports_ready` and wait until `ready=true`.
-4. `analyze_export_job` for full job analysis, or `analyze_audio_file` for direct single-file analysis.
+4. `analyze_export_job` for full job analysis (`analysis_profile="mix"` or `"mastering"`), or
+   `analyze_audio_file` / `analyze_mastering_file` for direct single-file analysis.
 
 `analyze_audio_file` supports `.wav` natively and `.mp3`, `.aif/.aiff`, `.flac` (plus `.m4a` where available)
 by decoding non-WAV inputs to `AbletonMCP/analysis/tmp_decoded/` with `ffmpeg`.
@@ -171,12 +172,33 @@ Once the config file has been set on Claude, and the remote script is running in
 ## Capabilities
 
 - Get session and track information
+- Inspect routing/topology for tracks, returns, sends, buses, and master (`get_mix_topology`, `get_send_matrix`)
+- Inspect return-track and master device chains (`get_return_tracks_info`, `get_master_track_device_chain`)
 - Create and modify MIDI and audio tracks
 - Create, edit, and trigger clips
 - Control playback
 - Load instruments and effects from Ableton's browser
 - Add notes to MIDI clips
 - Change tempo and other session parameters
+- Inspect device parameters (`get_device_parameters`)
+- Export-based audio analysis for mix checks and mastering metrics (`analyze_export_job`, `analyze_mastering_file`)
+- Source inventory + spectral/loudness summaries for arrangement clips (`index_sources_from_live_set`)
+- Mix/master context helpers for LLM guidance (`build_mix_context_profile`, `build_mix_master_context`)
+- Semantic role inference and tag persistence (`infer_mix_context_tags`, `get_mix_context_tags`, `save_mix_context_tags`)
+- Automation-state overview (read-first; envelope points not yet exposed) (`get_automation_overview`, `get_track_automation_targets`)
+
+## Mix/Master Readiness (Read-First)
+
+This repo now includes read-first tools aimed at mixing/mastering assistance (without automating the moves yet):
+
+- `get_mix_topology`: tracks, group buses, sends, returns, master chain, and routing edges
+- `get_send_matrix`: compact view of which tracks feed which returns and by how much
+- `infer_mix_context_tags` / `save_mix_context_tags`: semantic roles like `lead_vocal`, `drums_bus`, `main_reverb`
+- `build_mix_context_profile`: merges explicit tags with deterministic name-based inference
+- `analyze_mastering_file`: loudness, true peak, stereo correlation/width, mono fold-down deltas, clipping count
+- `build_mix_master_context`: LLM-ready payload with stage readiness for mix prep, submix, exports, and mastering
+
+`build_mix_master_context` is designed to tell an LLM what is present, what is missing, and which MCP tools to call next.
 
 ## Example Commands
 
@@ -192,6 +214,11 @@ Here are some examples of what you can ask Claude to do:
 - "Add a jazz chord progression to the clip in track 1"
 - "Set the tempo to 120 BPM"
 - "Play the clip in track 2"
+- "Show my sends/returns/master routing topology"
+- "Which tracks are feeding my reverb returns and at what levels?"
+- "Infer track roles (lead vocal, kick, snare, buses) and save them"
+- "Analyze this printed mix for mastering metrics"
+- "Build a mix/master context and tell me which pipeline stages are still missing data"
 
 
 ## Troubleshooting
