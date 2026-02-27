@@ -9,17 +9,25 @@ import math
 import re
 import shutil
 import subprocess
+import copy
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List, Union, Optional, Tuple
 from MCP_Server.audio_analysis import analyze_wav_file, AudioAnalysisError
+from MCP_Server.als_automation import (
+    read_arrangement_automation_from_project_als,
+    enumerate_non_track_arrangement_automation_from_project_als,
+    build_als_automation_inventory,
+    get_als_automation_target_points_from_inventory,
+)
 from MCP_Server.pathing import (
     get_export_dir,
     get_analysis_dir,
     ensure_dirs_exist,
     bootstrap_project_environment,
     resolve_pathing,
+    get_project_root,
 )
 
 try:
@@ -7585,12 +7593,540 @@ def get_track_automation_targets(ctx: Context, track_index: int) -> Dict[str, An
     }
 
 
+def _apply_als_arrangement_automation_fallback(
+    base_result: Dict[str, Any],
+    track_index: int,
+    scope: str,
+    mixer_target: str,
+    als_file_path: Optional[str],
+    send_index: Optional[int],
+    device_index: Optional[int],
+    parameter_index: Optional[int],
+    start_time_beats: Optional[float],
+    end_time_beats: Optional[float],
+) -> Dict[str, Any]:
+    """
+    Merge exact arrangement automation points from the saved .als file when Live API access is missing.
+
+    This keeps the public tool stable while adding a stronger fallback for arrangement automation
+    breakpoints (track mixer and device parameters).
+    """
+    if not isinstance(base_result, dict):
+        return base_result
+
+    existing_points = base_result.get("points")
+    has_point_rows = isinstance(existing_points, list) and len(existing_points) > 0
+    point_access_supported = bool(base_result.get("point_access_supported", False))
+
+    # If Live API already returned direct point access rows, do not replace them.
+    if point_access_supported and has_point_rows:
+        return base_result
+
+    try:
+        project_root = get_project_root()
+        als_result = read_arrangement_automation_from_project_als(
+            project_root=project_root,
+            track_index=int(track_index),
+            scope=scope,
+            mixer_target=mixer_target,
+            als_file_path=als_file_path,
+            send_index=send_index,
+            device_index=device_index,
+            parameter_index=parameter_index,
+            start_time_beats=start_time_beats,
+            end_time_beats=end_time_beats,
+        )
+    except Exception as exc:
+        merged = dict(base_result)
+        warnings = list(merged.get("warnings") or [])
+        warnings.append("als_fallback_exception")
+        merged["warnings"] = warnings
+        merged["als_fallback_error"] = str(exc)
+        return merged
+
+    if not isinstance(als_result, dict):
+        return base_result
+
+    # Preserve unsupported ALS fallback info as diagnostics, but only replace payload if ALS can answer.
+    if als_result.get("ok") is not True or als_result.get("supported") is not True:
+        merged = dict(base_result)
+        warnings = list(merged.get("warnings") or [])
+        for warning in list(als_result.get("warnings") or []):
+            if isinstance(warning, str) and warning not in warnings:
+                warnings.append(warning)
+        merged["warnings"] = warnings
+        if isinstance(als_result.get("reason"), str):
+            merged["als_fallback_reason"] = als_result.get("reason")
+        if isinstance(als_result.get("als_file_path"), str):
+            merged["als_file_path"] = als_result.get("als_file_path")
+        return merged
+
+    def _normalize_name_for_match(value: Any) -> Optional[str]:
+        text = _safe_text_value(value)
+        if not text:
+            return None
+        # split camel case and normalize punctuation/spacing
+        text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
+        text = text.replace("_", " ").replace(".", " ").replace("-", " ")
+        text = re.sub(r"\s+", " ", text).strip().lower()
+        return text or None
+
+    def _device_name_candidates_from_als_target(als_target_payload: Dict[str, Any]) -> List[str]:
+        candidates: List[str] = []
+        xml_tag = _safe_text_value(als_target_payload.get("device_xml_tag"))
+        name_hint = _safe_text_value(als_target_payload.get("device_name_hint"))
+        for value in (name_hint, xml_tag):
+            normalized = _normalize_name_for_match(value)
+            if normalized and normalized not in candidates:
+                candidates.append(normalized)
+
+        # Common internal ALS tags -> Live UI names
+        xml_alias_map = {
+            "stereogain": ["utility"],
+            "eqeight": ["eq eight"],
+            "compressor2": ["compressor"],
+            "autofilter": ["auto filter"],
+            "hybridreverb": ["hybrid reverb"],
+            "drumbus": ["drum buss"],
+            "gluecompressor": ["glue compressor"],
+            "saturator": ["saturator"],
+        }
+        xml_key = _normalize_name_for_match(xml_tag)
+        if xml_key and xml_key in xml_alias_map:
+            for alias in xml_alias_map.get(xml_key, []):
+                normalized = _normalize_name_for_match(alias)
+                if normalized and normalized not in candidates:
+                    candidates.append(normalized)
+        return candidates
+
+    def _parameter_name_candidates_from_als_target(als_target_payload: Dict[str, Any]) -> List[str]:
+        candidates: List[str] = []
+        for value in (
+            als_target_payload.get("parameter_display_name_hint"),
+            als_target_payload.get("parameter_name_hint"),
+            als_target_payload.get("parameter_xml_tag"),
+        ):
+            normalized = _normalize_name_for_match(value)
+            if normalized and normalized not in candidates:
+                candidates.append(normalized)
+
+        xml_tag = _safe_text_value(als_target_payload.get("parameter_xml_tag"))
+        xml_norm = _normalize_name_for_match(xml_tag)
+        macro_match = re.match(r"^macro controls (\d+)$", xml_norm or "")
+        if macro_match:
+            idx = _safe_int_value(macro_match.group(1))
+            if idx is not None:
+                macro_alias = _normalize_name_for_match("Macro {0}".format(int(idx) + 1))
+                if macro_alias and macro_alias not in candidates:
+                    candidates.append(macro_alias)
+        return candidates
+
+    def _verify_device_parameter_mapping(
+        live_target_payload: Dict[str, Any],
+        als_target_payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        live_device = _normalize_name_for_match(live_target_payload.get("device_name"))
+        live_param = _normalize_name_for_match(live_target_payload.get("parameter_name"))
+        als_device_candidates = _device_name_candidates_from_als_target(als_target_payload)
+        als_param_candidates = _parameter_name_candidates_from_als_target(als_target_payload)
+
+        verification = {
+            "kind": "device_parameter",
+            "live_device_name": _safe_text_value(live_target_payload.get("device_name")),
+            "live_parameter_name": _safe_text_value(live_target_payload.get("parameter_name")),
+            "als_device_candidates": als_device_candidates,
+            "als_parameter_candidates": als_param_candidates,
+        }
+
+        # We harden by refusing an ALS merge when parameter mapping is unverifiable or mismatched.
+        if not live_param or not als_param_candidates:
+            verification["ok"] = False
+            verification["reason"] = "device_parameter_mapping_unverifiable"
+            return verification
+        if live_param not in als_param_candidates:
+            verification["ok"] = False
+            verification["reason"] = "device_parameter_mapping_mismatch"
+            return verification
+
+        # Device names are advisory, but if present and contradictory we also block.
+        if live_device and als_device_candidates and live_device not in als_device_candidates:
+            verification["ok"] = False
+            verification["reason"] = "device_name_mapping_mismatch"
+            return verification
+
+        verification["ok"] = True
+        verification["reason"] = "verified"
+        return verification
+
+    als_target_for_verify = als_result.get("target") if isinstance(als_result.get("target"), dict) else {}
+    live_target_for_verify = base_result.get("target") if isinstance(base_result.get("target"), dict) else {}
+    if (_safe_text_value(scope) or "").lower() == "device_parameter":
+        verification = _verify_device_parameter_mapping(live_target_for_verify, als_target_for_verify)
+        if verification.get("ok") is not True:
+            merged = dict(base_result)
+            warnings = list(merged.get("warnings") or [])
+            reason = _safe_text_value(verification.get("reason")) or "device_parameter_mapping_ambiguous"
+            if reason not in warnings:
+                warnings.append(reason)
+            merged["warnings"] = warnings
+            merged["als_mapping_verification"] = verification
+            merged["als_fallback_reason"] = reason
+            if isinstance(als_result.get("als_file_path"), str):
+                merged["als_file_path"] = als_result.get("als_file_path")
+            return merged
+
+    merged = dict(base_result)
+    merged["live_api_supported"] = bool(base_result.get("supported", False)) if "supported" in base_result else None
+    if base_result.get("reason") is not None:
+        merged["live_api_reason"] = base_result.get("reason")
+
+    # Replace point-related fields with exact arrangement data from .als
+    merged["supported"] = True
+    merged["envelope_exists"] = als_result.get("envelope_exists")
+    merged["point_access_supported"] = bool(als_result.get("point_access_supported", False))
+    merged["points"] = list(als_result.get("points") or [])
+    merged["source"] = "hybrid"
+    merged["point_source"] = "als_arrangement_file"
+    merged["arrangement_automation_source"] = "als_file"
+    merged["als_fallback_used"] = True
+    if isinstance(als_result.get("source_kind"), str):
+        merged["arrangement_automation_source_kind"] = als_result.get("source_kind")
+    if isinstance(als_result.get("als_file_path"), str):
+        merged["als_file_path"] = als_result.get("als_file_path")
+    if isinstance(als_result.get("als_file_mtime_utc"), str):
+        merged["als_file_mtime_utc"] = als_result.get("als_file_mtime_utc")
+    if _safe_int_value(als_result.get("als_candidate_count")) is not None:
+        merged["als_candidate_count"] = _safe_int_value(als_result.get("als_candidate_count"))
+
+    if not isinstance(merged.get("target"), dict):
+        merged["target"] = {}
+    als_target = als_result.get("target")
+    if isinstance(als_target, dict):
+        for key, value in als_target.items():
+            if key not in merged["target"] or merged["target"].get(key) in (None, ""):
+                merged["target"][key] = value
+        # Keep the resolved automation target id even if target already existed.
+        if "automation_target_id" in als_target:
+            merged["target"]["automation_target_id"] = als_target.get("automation_target_id")
+
+    if not _safe_text_value(merged.get("track_name")) and _safe_text_value(als_result.get("track_name")):
+        merged["track_name"] = als_result.get("track_name")
+
+    warnings = list(merged.get("warnings") or [])
+    for warning in list(als_result.get("warnings") or []):
+        if isinstance(warning, str) and warning not in warnings:
+            warnings.append(warning)
+    merged["warnings"] = warnings
+    if (_safe_text_value(scope) or "").lower() == "device_parameter":
+        merged["als_mapping_verification"] = {"ok": True, "reason": "verified"}
+
+    return merged
+
+
+@mcp.tool()
+def get_clip_automation_envelope_points(
+    ctx: Context,
+    track_index: int,
+    clip_scope: str = "session",
+    clip_slot_index: Optional[int] = None,
+    clip_index: Optional[int] = None,
+    scope: str = "device_parameter",
+    mixer_target: str = "volume",
+    send_index: Optional[int] = None,
+    device_index: Optional[int] = None,
+    parameter_index: Optional[int] = None,
+    start_time_beats: Optional[float] = None,
+    end_time_beats: Optional[float] = None,
+    sample_points: int = 0
+) -> Dict[str, Any]:
+    """
+    Return clip automation envelope points (best effort) for a session/arrangement clip and target parameter.
+
+    Parameters:
+    - track_index: 0-based normal track index
+    - clip_scope: "session" or "arrangement"
+    - clip_slot_index: required for clip_scope="session"
+    - clip_index: required for clip_scope="arrangement"
+    - scope: "track_mixer" or "device_parameter"
+    - mixer_target: for track_mixer scope: "volume", "panning", or "send"
+    - send_index: required when scope="track_mixer" and mixer_target="send"
+    - device_index: required when scope="device_parameter"
+    - parameter_index: required when scope="device_parameter"
+    - start_time_beats/end_time_beats: optional sampling range when point access is unavailable
+    - sample_points: optional sampled fallback count via envelope.value_at_time
+    """
+    _ = ctx
+
+    track_index_value = _safe_int_value(track_index)
+    if track_index_value is None or track_index_value < 0:
+        return {
+            "ok": False,
+            "error": "invalid_track_index",
+            "message": "track_index must be a non-negative integer",
+            "track_index": track_index
+        }
+
+    clip_scope_value = (_safe_text_value(clip_scope) or "session").lower()
+    if clip_scope_value not in {"session", "arrangement"}:
+        return {
+            "ok": False,
+            "error": "invalid_clip_scope",
+            "message": "clip_scope must be 'session' or 'arrangement'",
+            "track_index": track_index_value,
+            "clip_scope": clip_scope
+        }
+
+    if clip_scope_value == "session":
+        clip_slot_index_value = _safe_int_value(clip_slot_index)
+        if clip_slot_index_value is None or clip_slot_index_value < 0:
+            return {
+                "ok": False,
+                "error": "invalid_clip_slot_index",
+                "message": "clip_slot_index must be a non-negative integer for clip_scope='session'",
+                "track_index": track_index_value,
+                "clip_scope": clip_scope_value,
+                "clip_slot_index": clip_slot_index
+            }
+    else:
+        clip_index_value = _safe_int_value(clip_index)
+        if clip_index_value is None or clip_index_value < 0:
+            return {
+                "ok": False,
+                "error": "invalid_clip_index",
+                "message": "clip_index must be a non-negative integer for clip_scope='arrangement'",
+                "track_index": track_index_value,
+                "clip_scope": clip_scope_value,
+                "clip_index": clip_index
+            }
+
+    scope_value = (_safe_text_value(scope) or "device_parameter").lower()
+    mixer_target_value = (_safe_text_value(mixer_target) or "volume").lower()
+
+    if scope_value not in {"track_mixer", "device_parameter"}:
+        return {
+            "ok": False,
+            "error": "invalid_scope",
+            "message": "scope must be 'track_mixer' or 'device_parameter'",
+            "track_index": track_index_value,
+            "scope": scope
+        }
+
+    if scope_value == "track_mixer" and mixer_target_value not in {"volume", "panning", "send"}:
+        return {
+            "ok": False,
+            "error": "invalid_mixer_target",
+            "message": "mixer_target must be one of: volume, panning, send",
+            "track_index": track_index_value,
+            "scope": scope_value,
+            "mixer_target": mixer_target
+        }
+
+    if scope_value == "track_mixer" and mixer_target_value == "send":
+        send_index_value = _safe_int_value(send_index)
+        if send_index_value is None or send_index_value < 0:
+            return {
+                "ok": False,
+                "error": "invalid_send_index",
+                "message": "send_index must be a non-negative integer for mixer_target='send'",
+                "track_index": track_index_value,
+                "scope": scope_value,
+                "mixer_target": mixer_target_value,
+                "send_index": send_index
+            }
+
+    if scope_value == "device_parameter":
+        device_index_value = _safe_int_value(device_index)
+        parameter_index_value = _safe_int_value(parameter_index)
+        if device_index_value is None or device_index_value < 0:
+            return {
+                "ok": False,
+                "error": "invalid_device_index",
+                "message": "device_index must be a non-negative integer for scope='device_parameter'",
+                "track_index": track_index_value,
+                "scope": scope_value,
+                "device_index": device_index
+            }
+        if parameter_index_value is None or parameter_index_value < 0:
+            return {
+                "ok": False,
+                "error": "invalid_parameter_index",
+                "message": "parameter_index must be a non-negative integer for scope='device_parameter'",
+                "track_index": track_index_value,
+                "scope": scope_value,
+                "device_index": device_index_value,
+                "parameter_index": parameter_index
+            }
+
+    params: Dict[str, Any] = {
+        "track_index": track_index_value,
+        "clip_scope": clip_scope_value,
+        "scope": scope_value,
+        "mixer_target": mixer_target_value,
+        "sample_points": max(0, _safe_int_value(sample_points) or 0),
+    }
+    if clip_slot_index is not None:
+        params["clip_slot_index"] = _safe_int_value(clip_slot_index)
+    if clip_index is not None:
+        params["clip_index"] = _safe_int_value(clip_index)
+    if send_index is not None:
+        params["send_index"] = _safe_int_value(send_index)
+    if device_index is not None:
+        params["device_index"] = _safe_int_value(device_index)
+    if parameter_index is not None:
+        params["parameter_index"] = _safe_int_value(parameter_index)
+    if start_time_beats is not None:
+        params["start_time_beats"] = _safe_float_value(start_time_beats)
+    if end_time_beats is not None:
+        params["end_time_beats"] = _safe_float_value(end_time_beats)
+
+    try:
+        ableton = get_ableton_connection()
+        raw = ableton.send_command("get_clip_automation_envelope_points", params)
+    except Exception as e:
+        message = str(e)
+        if "Unknown command: get_clip_automation_envelope_points" in message:
+            return {
+                "ok": True,
+                "supported": False,
+                "reason": "backend_command_unavailable",
+                "message": message,
+                "track_index": track_index_value,
+                "clip_scope": clip_scope_value,
+                "clip_slot_index": _safe_int_value(clip_slot_index),
+                "clip_index": _safe_int_value(clip_index),
+                "target": {
+                    "scope": scope_value,
+                    "mixer_target": mixer_target_value,
+                    "send_index": _safe_int_value(send_index),
+                    "device_index": _safe_int_value(device_index),
+                    "parameter_index": _safe_int_value(parameter_index),
+                },
+                "point_access_supported": False,
+                "envelope_exists": None,
+                "points": [],
+                "sampled_series": [],
+                "warnings": ["backend_command_unavailable"]
+            }
+        logger.error(f"Error getting clip automation envelope points: {message}")
+        return {
+            "ok": False,
+            "error": "get_clip_automation_envelope_points_failed",
+            "message": message,
+            "track_index": track_index_value,
+            "clip_scope": clip_scope_value,
+            "clip_slot_index": _safe_int_value(clip_slot_index),
+            "clip_index": _safe_int_value(clip_index),
+        }
+
+    payload, payload_error = _coerce_json_dict(raw)
+    if payload is None:
+        return {
+            "ok": False,
+            "error": "invalid_response",
+            "message": payload_error or "Backend returned invalid payload",
+            "track_index": track_index_value,
+            "clip_scope": clip_scope_value
+        }
+
+    result = dict(payload)
+    if "ok" not in result:
+        result["ok"] = True
+
+    result["supported"] = bool(result.get("supported", False)) if "supported" in result else False
+    result["envelope_exists"] = result.get("envelope_exists")
+    result["point_access_supported"] = bool(result.get("point_access_supported", False)) if "point_access_supported" in result else False
+    if not isinstance(result.get("warnings"), list):
+        result["warnings"] = []
+
+    result.setdefault("track_index", track_index_value)
+    result.setdefault("clip_scope", clip_scope_value)
+    if clip_scope_value == "session" and "clip_slot_index" not in result:
+        result["clip_slot_index"] = _safe_int_value(clip_slot_index)
+    if clip_scope_value == "arrangement" and "clip_index" not in result:
+        result["clip_index"] = _safe_int_value(clip_index)
+
+    clip_payload = result.get("clip")
+    if not isinstance(clip_payload, dict):
+        clip_payload = {}
+    clip_payload.setdefault("clip_scope", clip_scope_value)
+    result["clip"] = clip_payload
+
+    target_payload = result.get("target")
+    if not isinstance(target_payload, dict):
+        target_payload = {}
+    target_payload.setdefault("scope", scope_value)
+    if scope_value == "track_mixer":
+        target_payload.setdefault("mixer_target", mixer_target_value)
+    result["target"] = target_payload
+
+    def _normalize_point_rows(rows: Any, point_index_key: str = "point_index") -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        if not isinstance(rows, list):
+            return normalized
+        for idx, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            time_beats = _safe_float_value(row.get("time_beats"))
+            if time_beats is None:
+                time_beats = _safe_float_value(row.get("time"))
+            if time_beats is None:
+                continue
+
+            raw_value = row.get("value")
+            if isinstance(raw_value, bool):
+                value = raw_value
+            elif isinstance(raw_value, (int, float)):
+                value = raw_value
+            else:
+                parsed_float = _safe_float_value(raw_value)
+                if parsed_float is not None:
+                    value = parsed_float
+                elif isinstance(raw_value, str):
+                    value = raw_value
+                else:
+                    continue
+
+            point_index_value = _safe_int_value(row.get(point_index_key))
+            normalized_row: Dict[str, Any] = {
+                point_index_key: point_index_value if point_index_value is not None else idx,
+                "time_beats": time_beats,
+                "value": value,
+            }
+            for optional_key in ("shape", "event_type", "value_kind"):
+                optional_value = _safe_text_value(row.get(optional_key))
+                if optional_value:
+                    normalized_row[optional_key] = optional_value
+            event_id_value = _safe_int_value(row.get("event_id"))
+            if event_id_value is not None:
+                normalized_row["event_id"] = event_id_value
+            if row.get("is_pre_roll_default") is True:
+                normalized_row["is_pre_roll_default"] = True
+            curve_payload = row.get("curve")
+            if isinstance(curve_payload, dict):
+                curve_clean: Dict[str, float] = {}
+                for curve_key, curve_value in curve_payload.items():
+                    curve_float = _safe_float_value(curve_value)
+                    if curve_float is None:
+                        continue
+                    curve_clean[str(curve_key)] = curve_float
+                if curve_clean:
+                    normalized_row["curve"] = curve_clean
+            normalized.append(normalized_row)
+        normalized.sort(key=lambda row: (_safe_float_value(row.get("time_beats")) or 0.0, _safe_int_value(row.get(point_index_key)) or 0))
+        return normalized
+
+    result["points"] = _normalize_point_rows(result.get("points"), point_index_key="point_index")
+    result["sampled_series"] = _normalize_point_rows(result.get("sampled_series"), point_index_key="sample_index")
+    return result
+
+
 @mcp.tool()
 def get_automation_envelope_points(
     ctx: Context,
     track_index: int,
     scope: str = "track_mixer",
     mixer_target: str = "volume",
+    als_file_path: Optional[str] = None,
     send_index: Optional[int] = None,
     device_index: Optional[int] = None,
     parameter_index: Optional[int] = None,
@@ -7605,6 +8141,7 @@ def get_automation_envelope_points(
     - track_index: 0-based normal track index
     - scope: "track_mixer" or "device_parameter"
     - mixer_target: for track_mixer scope: "volume", "panning", or "send"
+    - als_file_path: optional explicit .als file path for arrangement automation fallback
     - send_index: required when scope="track_mixer" and mixer_target="send"
     - device_index: required when scope="device_parameter"
     - parameter_index: required when scope="device_parameter"
@@ -7696,6 +8233,7 @@ def get_automation_envelope_points(
         params["start_time_beats"] = _safe_float_value(start_time_beats)
     if end_time_beats is not None:
         params["end_time_beats"] = _safe_float_value(end_time_beats)
+    als_file_path_value = _safe_text_value(als_file_path)
 
     try:
         ableton = get_ableton_connection()
@@ -7703,7 +8241,7 @@ def get_automation_envelope_points(
     except Exception as e:
         message = str(e)
         if "Unknown command: get_automation_envelope_points" in message:
-            return {
+            base_result = {
                 "ok": True,
                 "supported": False,
                 "reason": "backend_command_unavailable",
@@ -7722,6 +8260,18 @@ def get_automation_envelope_points(
                 "sampled_series": [],
                 "warnings": ["backend_command_unavailable"]
             }
+            return _apply_als_arrangement_automation_fallback(
+                base_result=base_result,
+                track_index=track_index_value,
+                scope=scope_value,
+                mixer_target=mixer_target_value,
+                als_file_path=als_file_path_value,
+                send_index=_safe_int_value(send_index),
+                device_index=_safe_int_value(device_index),
+                parameter_index=_safe_int_value(parameter_index),
+                start_time_beats=_safe_float_value(start_time_beats),
+                end_time_beats=_safe_float_value(end_time_beats),
+            )
         logger.error(f"Error getting automation envelope points: {message}")
         return {
             "ok": False,
@@ -7766,6 +8316,19 @@ def get_automation_envelope_points(
         target_payload.setdefault("mixer_target", mixer_target_value)
     result["target"] = target_payload
 
+    result = _apply_als_arrangement_automation_fallback(
+        base_result=result,
+        track_index=track_index_value,
+        scope=scope_value,
+        mixer_target=mixer_target_value,
+        als_file_path=als_file_path_value,
+        send_index=_safe_int_value(send_index),
+        device_index=_safe_int_value(device_index),
+        parameter_index=_safe_int_value(parameter_index),
+        start_time_beats=_safe_float_value(start_time_beats),
+        end_time_beats=_safe_float_value(end_time_beats),
+    )
+
     def _normalize_point_rows(rows: Any, point_index_key: str = "point_index") -> List[Dict[str, Any]]:
         normalized: List[Dict[str, Any]] = []
         if not isinstance(rows, list):
@@ -7774,11 +8337,23 @@ def get_automation_envelope_points(
             if not isinstance(row, dict):
                 continue
             time_beats = _safe_float_value(row.get("time_beats"))
-            value = _safe_float_value(row.get("value"))
             if time_beats is None:
                 time_beats = _safe_float_value(row.get("time"))
-            if value is None:
+            if time_beats is None:
                 continue
+            raw_value = row.get("value")
+            if isinstance(raw_value, bool):
+                value = raw_value
+            elif isinstance(raw_value, (int, float)):
+                value = raw_value
+            else:
+                parsed_float = _safe_float_value(raw_value)
+                if parsed_float is not None:
+                    value = parsed_float
+                elif isinstance(raw_value, str):
+                    value = raw_value
+                else:
+                    continue
             point_index_value = _safe_int_value(row.get(point_index_key))
             normalized_row = {
                 point_index_key: point_index_value if point_index_value is not None else idx,
@@ -7788,6 +8363,27 @@ def get_automation_envelope_points(
             shape_value = _safe_text_value(row.get("shape"))
             if shape_value:
                 normalized_row["shape"] = shape_value
+            event_type = _safe_text_value(row.get("event_type"))
+            if event_type:
+                normalized_row["event_type"] = event_type
+            value_kind = _safe_text_value(row.get("value_kind"))
+            if value_kind:
+                normalized_row["value_kind"] = value_kind
+            event_id = _safe_int_value(row.get("event_id"))
+            if event_id is not None:
+                normalized_row["event_id"] = event_id
+            if row.get("is_pre_roll_default") is True:
+                normalized_row["is_pre_roll_default"] = True
+            curve_payload = row.get("curve")
+            if isinstance(curve_payload, dict):
+                curve_clean: Dict[str, float] = {}
+                for curve_key, curve_value in curve_payload.items():
+                    curve_float = _safe_float_value(curve_value)
+                    if curve_float is None:
+                        continue
+                    curve_clean[str(curve_key)] = curve_float
+                if curve_clean:
+                    normalized_row["curve"] = curve_clean
             normalized.append(normalized_row)
         normalized.sort(key=lambda row: (_safe_float_value(row.get("time_beats")) or 0.0, _safe_int_value(row.get(point_index_key)) or 0))
         return normalized
@@ -7890,6 +8486,758 @@ def get_automation_overview(ctx: Context, track_indices: Optional[List[int]] = N
         "fallback_guidance": [
             "Device parameter automation states are available in overview responses.",
             "Call get_automation_envelope_points for specific mixer/device targets when you need point data, or use export-based loudness timelines as a proxy."
+        ]
+    }
+
+
+@mcp.tool()
+def enumerate_project_automation(
+    ctx: Context,
+    track_indices: Optional[List[int]] = None,
+    als_file_path: Optional[str] = None,
+    include_arrangement_mixer_points: bool = True,
+    include_clip_envelopes: bool = True,
+    include_device_parameter_points: bool = False,
+    include_return_master_context: bool = True,
+    max_clips_per_track: int = 4,
+    sample_points: int = 0,
+    start_time_beats: Optional[float] = None,
+    end_time_beats: Optional[float] = None,
+    include_point_payloads: bool = False
+) -> Dict[str, Any]:
+    """
+    Enumerate automation coverage across the current project (broad scan + targeted point probes).
+
+    This is a read-only inventory tool intended to provide a broader project-wide picture than
+    `get_automation_overview`, while still reusing the safe single-target probe tools for exact points.
+
+    Parameters:
+    - track_indices: optional subset of normal tracks to scan
+    - als_file_path: optional explicit .als file for arrangement automation fallback
+    - include_arrangement_mixer_points: probe track mixer arrangement automation (volume/pan/send)
+    - include_clip_envelopes: probe clip envelopes for discovered session/arrangement clips (limited per track)
+    - include_device_parameter_points: probe exact device-parameter arrangement envelopes for automated params
+    - include_return_master_context: include return/master chain inventory + explicit automation coverage gaps
+    - max_clips_per_track: cap clip-envelope probes per track per clip scope
+    - sample_points/start_time_beats/end_time_beats: optional sampling hints for point probe fallbacks
+    - include_point_payloads: include full `points`/`sampled_series` in probe rows (can be large)
+    """
+    _ = ctx
+
+    def _point_probe_summary(payload: Any) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {
+                "ok": False,
+                "error": "invalid_probe_payload",
+                "probe_payload_type": str(type(payload))
+            }
+
+        summary: Dict[str, Any] = {
+            "ok": bool(payload.get("ok", False)),
+            "supported": bool(payload.get("supported", False)) if "supported" in payload else None,
+            "reason": payload.get("reason"),
+            "error": payload.get("error"),
+            "envelope_exists": payload.get("envelope_exists"),
+            "point_access_supported": payload.get("point_access_supported"),
+            "point_source": payload.get("point_source"),
+            "source": payload.get("source"),
+            "warnings": list(payload.get("warnings") or []) if isinstance(payload.get("warnings"), list) else [],
+        }
+
+        target_payload = payload.get("target")
+        if isinstance(target_payload, dict):
+            target_summary: Dict[str, Any] = {}
+            for key in (
+                "scope", "mixer_target", "send_index",
+                "device_index", "device_name",
+                "parameter_index", "parameter_name",
+                "automation_target_id"
+            ):
+                if key in target_payload:
+                    target_summary[key] = target_payload.get(key)
+            if target_summary:
+                summary["target"] = target_summary
+
+        clip_payload = payload.get("clip")
+        if isinstance(clip_payload, dict):
+            clip_summary: Dict[str, Any] = {}
+            for key in (
+                "clip_scope", "clip_slot_index", "clip_index",
+                "clip_name", "is_audio_clip", "is_midi_clip", "length_beats"
+            ):
+                if key in clip_payload:
+                    clip_summary[key] = clip_payload.get(key)
+            if clip_summary:
+                summary["clip"] = clip_summary
+
+        points = payload.get("points")
+        if isinstance(points, list):
+            summary["point_count"] = len(points)
+            if points:
+                first_time = _safe_float_value(points[0].get("time_beats")) if isinstance(points[0], dict) else None
+                last_time = _safe_float_value(points[-1].get("time_beats")) if isinstance(points[-1], dict) else None
+                if first_time is not None:
+                    summary["first_point_time_beats"] = first_time
+                if last_time is not None:
+                    summary["last_point_time_beats"] = last_time
+        else:
+            summary["point_count"] = 0
+
+        sampled = payload.get("sampled_series")
+        if isinstance(sampled, list):
+            summary["sample_count"] = len(sampled)
+
+        if "als_fallback_used" in payload:
+            summary["als_fallback_used"] = bool(payload.get("als_fallback_used"))
+        if isinstance(payload.get("als_fallback_reason"), str):
+            summary["als_fallback_reason"] = payload.get("als_fallback_reason")
+        if isinstance(payload.get("als_file_path"), str):
+            summary["als_file_path"] = payload.get("als_file_path")
+        if isinstance(payload.get("als_mapping_verification"), dict):
+            summary["als_mapping_verification"] = payload.get("als_mapping_verification")
+
+        if include_point_payloads:
+            summary["points"] = list(points or []) if isinstance(points, list) else []
+            summary["sampled_series"] = list(sampled or []) if isinstance(sampled, list) else []
+
+        return summary
+
+    def _compact_track_target_summary(payload: Any) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {"ok": False, "error": "invalid_track_target_payload"}
+        if payload.get("ok") is not True:
+            return {
+                "ok": False,
+                "error": payload.get("error"),
+                "message": payload.get("message")
+            }
+
+        summary = payload.get("summary", {})
+        out: Dict[str, Any] = {
+            "ok": True,
+            "track_name": payload.get("track_name"),
+            "summary": summary if isinstance(summary, dict) else {},
+            "track_mixer_targets": payload.get("track_mixer_targets"),
+            "warnings": list(payload.get("warnings") or []) if isinstance(payload.get("warnings"), list) else [],
+        }
+
+        devices_out: List[Dict[str, Any]] = []
+        for device in list(payload.get("devices") or []):
+            if not isinstance(device, dict):
+                continue
+            if device.get("has_automation") is not True and int(device.get("automated_parameter_count", 0) or 0) <= 0:
+                continue
+            device_row = {
+                "device_index": device.get("device_index"),
+                "device_name": device.get("device_name"),
+                "class_name": device.get("class_name"),
+                "automated_parameter_count": device.get("automated_parameter_count"),
+            }
+            automated_params = []
+            for param in list(device.get("parameters") or []):
+                if not isinstance(param, dict):
+                    continue
+                if param.get("automated") is not True:
+                    continue
+                automated_params.append({
+                    "parameter_index": param.get("parameter_index"),
+                    "name": param.get("name"),
+                    "automation_state": param.get("automation_state"),
+                    "automated": True
+                })
+            device_row["automated_parameters"] = automated_params
+            devices_out.append(device_row)
+        out["devices_with_automation"] = devices_out
+        return out
+
+    session_payload, session_error = _coerce_json_dict(get_session_info(ctx))
+    if session_payload is None:
+        return {
+            "ok": False,
+            "error": "session_info_unavailable",
+            "message": session_error or "Failed to retrieve session info"
+        }
+
+    overview = get_automation_overview(ctx, track_indices=track_indices)
+    if not isinstance(overview, dict) or overview.get("ok") is not True:
+        return {
+            "ok": False,
+            "error": "automation_overview_unavailable",
+            "message": (
+                overview.get("message") if isinstance(overview, dict) else "Invalid automation overview response"
+            ),
+            "details": overview if isinstance(overview, dict) else None
+        }
+
+    max_clips_value = _safe_int_value(max_clips_per_track)
+    if max_clips_value is None:
+        max_clips_value = 4
+    max_clips_value = max(0, min(max_clips_value, 128))
+    sample_points_value = max(0, _safe_int_value(sample_points) or 0)
+    start_time_beats_value = _safe_float_value(start_time_beats)
+    end_time_beats_value = _safe_float_value(end_time_beats)
+    als_file_path_value = _safe_text_value(als_file_path)
+
+    send_counts_by_track: Dict[int, int] = {}
+    topology_warnings: List[str] = []
+    if include_arrangement_mixer_points:
+        try:
+            topology = get_mix_topology(ctx, include_device_chains=False, include_device_parameters=False)
+            if isinstance(topology, dict) and topology.get("ok") is True:
+                for row in list(topology.get("tracks") or []):
+                    if not isinstance(row, dict):
+                        continue
+                    idx = _safe_int_value(row.get("index"))
+                    if idx is None:
+                        continue
+                    sends = row.get("sends")
+                    send_counts_by_track[idx] = len(sends) if isinstance(sends, list) else 0
+            elif isinstance(topology, dict):
+                topology_warnings.append("mix_topology_unavailable")
+        except Exception:
+            topology_warnings.append("mix_topology_exception")
+
+    coverage = {
+        "tracks_scanned": 0,
+        "tracks_with_device_automation": int(overview.get("tracks_with_device_automation", 0) or 0),
+        "total_automated_parameters": int(overview.get("total_automated_parameters", 0) or 0),
+        "arrangement_mixer_point_queries": 0,
+        "arrangement_mixer_envelopes_found": 0,
+        "device_parameter_point_queries": 0,
+        "device_parameter_envelopes_found": 0,
+        "device_parameter_als_mismatch_blocks": 0,
+        "clip_envelope_probes": 0,
+        "clip_envelopes_found": 0,
+        "session_clips_seen": 0,
+        "arrangement_clips_seen": 0,
+        "return_point_queries": 0,
+        "return_envelopes_found": 0,
+        "master_point_queries": 0,
+        "master_envelopes_found": 0,
+        "global_point_queries": 0,
+        "global_envelopes_found": 0,
+    }
+
+    tracks_out: List[Dict[str, Any]] = []
+    warnings: List[str] = list(overview.get("warnings") or []) if isinstance(overview.get("warnings"), list) else []
+    warnings.extend([w for w in topology_warnings if w not in warnings])
+    gaps: List[Dict[str, Any]] = []
+
+    for overview_row in list(overview.get("tracks") or []):
+        if not isinstance(overview_row, dict):
+            continue
+        track_index_value = _safe_int_value(overview_row.get("track_index"))
+        if track_index_value is None:
+            continue
+        coverage["tracks_scanned"] += 1
+
+        track_row: Dict[str, Any] = {
+            "track_index": track_index_value,
+            "track_name": overview_row.get("track_name"),
+            "overview": {
+                "ok": bool(overview_row.get("ok", False)),
+                "devices_with_automation": overview_row.get("devices_with_automation"),
+                "automated_parameter_count": overview_row.get("automated_parameter_count"),
+                "track_mixer_targets": overview_row.get("track_mixer_targets"),
+                "warnings": list(overview_row.get("warnings") or []) if isinstance(overview_row.get("warnings"), list) else []
+            }
+        }
+
+        if overview_row.get("ok") is not True:
+            tracks_out.append(track_row)
+            continue
+
+        track_targets_payload: Optional[Dict[str, Any]] = None
+        needs_track_targets = bool(include_device_parameter_points) or bool(include_clip_envelopes)
+        if needs_track_targets and int(overview_row.get("automated_parameter_count", 0) or 0) > 0:
+            try:
+                track_targets_payload = get_track_automation_targets(ctx, track_index_value)
+            except Exception as exc:
+                track_targets_payload = {
+                    "ok": False,
+                    "error": "get_track_automation_targets_failed",
+                    "message": str(exc)
+                }
+            track_row["track_targets"] = _compact_track_target_summary(track_targets_payload)
+
+        automated_device_params: List[Dict[str, Any]] = []
+        if isinstance(track_targets_payload, dict) and track_targets_payload.get("ok") is True:
+            for device in list(track_targets_payload.get("devices") or []):
+                if not isinstance(device, dict):
+                    continue
+                device_index_value = _safe_int_value(device.get("device_index"))
+                if device_index_value is None:
+                    continue
+                device_name_value = _safe_text_value(device.get("device_name"))
+                for param in list(device.get("parameters") or []):
+                    if not isinstance(param, dict):
+                        continue
+                    if param.get("automated") is not True:
+                        continue
+                    param_index_value = _safe_int_value(param.get("parameter_index"))
+                    if param_index_value is None:
+                        continue
+                    automated_device_params.append({
+                        "device_index": device_index_value,
+                        "device_name": device_name_value,
+                        "parameter_index": param_index_value,
+                        "parameter_name": _safe_text_value(param.get("name")),
+                    })
+
+        if include_arrangement_mixer_points:
+            arrangement_mixer: Dict[str, Any] = {"targets": {}, "send_count_hint": send_counts_by_track.get(track_index_value, 0)}
+            for mixer_target_value in ("volume", "panning"):
+                probe_payload = get_automation_envelope_points(
+                    ctx,
+                    track_index=track_index_value,
+                    scope="track_mixer",
+                    mixer_target=mixer_target_value,
+                    als_file_path=als_file_path_value,
+                    start_time_beats=start_time_beats_value,
+                    end_time_beats=end_time_beats_value,
+                    sample_points=sample_points_value
+                )
+                probe_summary = _point_probe_summary(probe_payload)
+                arrangement_mixer["targets"][mixer_target_value] = probe_summary
+                coverage["arrangement_mixer_point_queries"] += 1
+                if probe_summary.get("envelope_exists") is True:
+                    coverage["arrangement_mixer_envelopes_found"] += 1
+
+            send_probe_rows: List[Dict[str, Any]] = []
+            send_count = max(0, _safe_int_value(send_counts_by_track.get(track_index_value)) or 0)
+            for send_idx in range(send_count):
+                probe_payload = get_automation_envelope_points(
+                    ctx,
+                    track_index=track_index_value,
+                    scope="track_mixer",
+                    mixer_target="send",
+                    send_index=send_idx,
+                    als_file_path=als_file_path_value,
+                    start_time_beats=start_time_beats_value,
+                    end_time_beats=end_time_beats_value,
+                    sample_points=sample_points_value
+                )
+                probe_summary = _point_probe_summary(probe_payload)
+                send_probe_rows.append({
+                    "send_index": send_idx,
+                    "probe": probe_summary
+                })
+                coverage["arrangement_mixer_point_queries"] += 1
+                if probe_summary.get("envelope_exists") is True:
+                    coverage["arrangement_mixer_envelopes_found"] += 1
+            arrangement_mixer["sends"] = send_probe_rows
+            track_row["arrangement_mixer"] = arrangement_mixer
+
+        if include_device_parameter_points:
+            device_point_rows: List[Dict[str, Any]] = []
+            for target in automated_device_params:
+                probe_payload = get_automation_envelope_points(
+                    ctx,
+                    track_index=track_index_value,
+                    scope="device_parameter",
+                    device_index=target["device_index"],
+                    parameter_index=target["parameter_index"],
+                    als_file_path=als_file_path_value,
+                    start_time_beats=start_time_beats_value,
+                    end_time_beats=end_time_beats_value,
+                    sample_points=sample_points_value
+                )
+                probe_summary = _point_probe_summary(probe_payload)
+                device_point_rows.append({
+                    "device_index": target["device_index"],
+                    "device_name": target.get("device_name"),
+                    "parameter_index": target["parameter_index"],
+                    "parameter_name": target.get("parameter_name"),
+                    "probe": probe_summary
+                })
+                coverage["device_parameter_point_queries"] += 1
+                if probe_summary.get("envelope_exists") is True:
+                    coverage["device_parameter_envelopes_found"] += 1
+                if _safe_text_value(probe_summary.get("als_fallback_reason")) in {
+                    "device_parameter_mapping_mismatch",
+                    "device_name_mapping_mismatch",
+                    "device_parameter_mapping_unverifiable",
+                }:
+                    coverage["device_parameter_als_mismatch_blocks"] += 1
+            track_row["device_parameter_points"] = {
+                "query_count": len(device_point_rows),
+                "targets": device_point_rows
+            }
+
+        if include_clip_envelopes:
+            clip_inventory: Dict[str, Any] = {
+                "session": {"supported": True, "clips": [], "warnings": []},
+                "arrangement": {"supported": True, "clips": [], "warnings": []},
+            }
+
+            session_clips_payload = list_session_clips(ctx, track_index_value)
+            if isinstance(session_clips_payload, dict) and "error" not in session_clips_payload:
+                session_clips = session_clips_payload.get("clips", [])
+                if not isinstance(session_clips, list):
+                    session_clips = []
+                coverage["session_clips_seen"] += len(session_clips)
+                for clip_row in session_clips[:max_clips_value]:
+                    if not isinstance(clip_row, dict):
+                        continue
+                    clip_slot_index_value = _safe_int_value(clip_row.get("clip_slot_index"))
+                    if clip_slot_index_value is None:
+                        continue
+                    clip_probe_rows: List[Dict[str, Any]] = []
+                    for mixer_target_value in ("volume", "panning"):
+                        clip_probe = get_clip_automation_envelope_points(
+                            ctx,
+                            track_index=track_index_value,
+                            clip_scope="session",
+                            clip_slot_index=clip_slot_index_value,
+                            scope="track_mixer",
+                            mixer_target=mixer_target_value,
+                            start_time_beats=start_time_beats_value,
+                            end_time_beats=end_time_beats_value,
+                            sample_points=sample_points_value
+                        )
+                        clip_probe_summary = _point_probe_summary(clip_probe)
+                        clip_probe_rows.append({
+                            "target_kind": "track_mixer",
+                            "mixer_target": mixer_target_value,
+                            "probe": clip_probe_summary
+                        })
+                        coverage["clip_envelope_probes"] += 1
+                        if clip_probe_summary.get("envelope_exists") is True:
+                            coverage["clip_envelopes_found"] += 1
+                    for target in automated_device_params:
+                        clip_probe = get_clip_automation_envelope_points(
+                            ctx,
+                            track_index=track_index_value,
+                            clip_scope="session",
+                            clip_slot_index=clip_slot_index_value,
+                            scope="device_parameter",
+                            device_index=target["device_index"],
+                            parameter_index=target["parameter_index"],
+                            start_time_beats=start_time_beats_value,
+                            end_time_beats=end_time_beats_value,
+                            sample_points=sample_points_value
+                        )
+                        clip_probe_summary = _point_probe_summary(clip_probe)
+                        clip_probe_rows.append({
+                            "target_kind": "device_parameter",
+                            "device_index": target["device_index"],
+                            "device_name": target.get("device_name"),
+                            "parameter_index": target["parameter_index"],
+                            "parameter_name": target.get("parameter_name"),
+                            "probe": clip_probe_summary
+                        })
+                        coverage["clip_envelope_probes"] += 1
+                        if clip_probe_summary.get("envelope_exists") is True:
+                            coverage["clip_envelopes_found"] += 1
+                    clip_inventory["session"]["clips"].append({
+                        "clip_slot_index": clip_slot_index_value,
+                        "clip_name": clip_row.get("clip_name"),
+                        "is_audio_clip": clip_row.get("is_audio_clip"),
+                        "is_midi_clip": clip_row.get("is_midi_clip"),
+                        "probes": clip_probe_rows
+                    })
+            else:
+                clip_inventory["session"]["supported"] = False
+                if isinstance(session_clips_payload, dict):
+                    clip_inventory["session"]["reason"] = session_clips_payload.get("error") or session_clips_payload.get("reason")
+                    clip_inventory["session"]["message"] = session_clips_payload.get("message")
+
+            arrangement_clips_payload = list_arrangement_clips(ctx, track_index_value)
+            if isinstance(arrangement_clips_payload, dict) and arrangement_clips_payload.get("supported") is not False and "error" not in arrangement_clips_payload:
+                arrangement_clips = arrangement_clips_payload.get("clips", [])
+                if not isinstance(arrangement_clips, list):
+                    arrangement_clips = []
+                coverage["arrangement_clips_seen"] += len(arrangement_clips)
+                for clip_row in arrangement_clips[:max_clips_value]:
+                    if not isinstance(clip_row, dict):
+                        continue
+                    clip_index_value = _safe_int_value(clip_row.get("clip_index"))
+                    if clip_index_value is None:
+                        continue
+                    clip_probe_rows: List[Dict[str, Any]] = []
+                    for mixer_target_value in ("volume", "panning"):
+                        clip_probe = get_clip_automation_envelope_points(
+                            ctx,
+                            track_index=track_index_value,
+                            clip_scope="arrangement",
+                            clip_index=clip_index_value,
+                            scope="track_mixer",
+                            mixer_target=mixer_target_value,
+                            start_time_beats=start_time_beats_value,
+                            end_time_beats=end_time_beats_value,
+                            sample_points=sample_points_value
+                        )
+                        clip_probe_summary = _point_probe_summary(clip_probe)
+                        clip_probe_rows.append({
+                            "target_kind": "track_mixer",
+                            "mixer_target": mixer_target_value,
+                            "probe": clip_probe_summary
+                        })
+                        coverage["clip_envelope_probes"] += 1
+                        if clip_probe_summary.get("envelope_exists") is True:
+                            coverage["clip_envelopes_found"] += 1
+                    for target in automated_device_params:
+                        clip_probe = get_clip_automation_envelope_points(
+                            ctx,
+                            track_index=track_index_value,
+                            clip_scope="arrangement",
+                            clip_index=clip_index_value,
+                            scope="device_parameter",
+                            device_index=target["device_index"],
+                            parameter_index=target["parameter_index"],
+                            start_time_beats=start_time_beats_value,
+                            end_time_beats=end_time_beats_value,
+                            sample_points=sample_points_value
+                        )
+                        clip_probe_summary = _point_probe_summary(clip_probe)
+                        clip_probe_rows.append({
+                            "target_kind": "device_parameter",
+                            "device_index": target["device_index"],
+                            "device_name": target.get("device_name"),
+                            "parameter_index": target["parameter_index"],
+                            "parameter_name": target.get("parameter_name"),
+                            "probe": clip_probe_summary
+                        })
+                        coverage["clip_envelope_probes"] += 1
+                        if clip_probe_summary.get("envelope_exists") is True:
+                            coverage["clip_envelopes_found"] += 1
+                    clip_inventory["arrangement"]["clips"].append({
+                        "clip_index": clip_index_value,
+                        "clip_name": clip_row.get("clip_name"),
+                        "is_audio_clip": clip_row.get("is_audio_clip"),
+                        "is_midi_clip": clip_row.get("is_midi_clip"),
+                        "start_time": clip_row.get("start_time"),
+                        "end_time": clip_row.get("end_time"),
+                        "probes": clip_probe_rows
+                    })
+            else:
+                clip_inventory["arrangement"]["supported"] = False
+                if isinstance(arrangement_clips_payload, dict):
+                    clip_inventory["arrangement"]["reason"] = arrangement_clips_payload.get("error") or arrangement_clips_payload.get("reason")
+                    clip_inventory["arrangement"]["message"] = arrangement_clips_payload.get("message")
+                    debug_payload = arrangement_clips_payload.get("debug")
+                    if isinstance(debug_payload, dict):
+                        clip_inventory["arrangement"]["debug"] = debug_payload
+
+            clip_inventory["session"]["clip_count"] = len(clip_inventory["session"]["clips"])
+            clip_inventory["arrangement"]["clip_count"] = len(clip_inventory["arrangement"]["clips"])
+            track_row["clip_inventory"] = clip_inventory
+
+        tracks_out.append(track_row)
+
+    returns_master_context = None
+    if include_return_master_context:
+        returns_payload = get_return_tracks_info(ctx, include_device_chains=True)
+        master_payload = get_master_track_device_chain(ctx)
+        non_track_als_inventory = None
+        non_track_als_summary = None
+        non_track_als_reason = None
+        try:
+            non_track_als_inventory = enumerate_non_track_arrangement_automation_from_project_als(
+                project_root=get_project_root(),
+                als_file_path=als_file_path_value,
+                start_time_beats=start_time_beats_value,
+                end_time_beats=end_time_beats_value,
+            )
+        except Exception as exc:
+            non_track_als_reason = "non_track_als_inventory_exception"
+            non_track_als_inventory = {
+                "ok": True,
+                "supported": False,
+                "reason": "non_track_als_inventory_exception",
+                "message": str(exc),
+                "returns": [],
+                "master": None,
+                "global": None,
+                "warnings": ["non_track_als_inventory_exception"],
+            }
+
+        if isinstance(non_track_als_inventory, dict) and non_track_als_inventory.get("supported") is True:
+            returns_summary_rows: List[Dict[str, Any]] = []
+            for return_row in list(non_track_als_inventory.get("returns") or []):
+                if not isinstance(return_row, dict):
+                    continue
+                target_summaries: Dict[str, Any] = {}
+                for key, value in (return_row.get("targets") or {}).items():
+                    if not isinstance(key, str):
+                        continue
+                    probe_summary = _point_probe_summary(value)
+                    target_summaries[key] = probe_summary
+                    coverage["return_point_queries"] += 1
+                    if probe_summary.get("envelope_exists") is True:
+                        coverage["return_envelopes_found"] += 1
+                send_rows_summary: List[Dict[str, Any]] = []
+                for send_row in list(return_row.get("sends") or []):
+                    if not isinstance(send_row, dict):
+                        continue
+                    probe_summary = _point_probe_summary(send_row.get("probe"))
+                    send_rows_summary.append({
+                        "send_index": _safe_int_value(send_row.get("send_index")),
+                        "probe": probe_summary
+                    })
+                    coverage["return_point_queries"] += 1
+                    if probe_summary.get("envelope_exists") is True:
+                        coverage["return_envelopes_found"] += 1
+                returns_summary_rows.append({
+                    "index": _safe_int_value(return_row.get("index")),
+                    "track_name": return_row.get("track_name"),
+                    "targets": target_summaries,
+                    "sends": send_rows_summary
+                })
+
+            master_summary = None
+            master_targets_in = non_track_als_inventory.get("master")
+            if isinstance(master_targets_in, dict):
+                master_target_rows: Dict[str, Any] = {}
+                for key, value in (master_targets_in.get("targets") or {}).items():
+                    if not isinstance(key, str):
+                        continue
+                    probe_summary = _point_probe_summary(value)
+                    master_target_rows[key] = probe_summary
+                    coverage["master_point_queries"] += 1
+                    if probe_summary.get("envelope_exists") is True:
+                        coverage["master_envelopes_found"] += 1
+                master_summary = {
+                    "track_name": master_targets_in.get("track_name"),
+                    "targets": master_target_rows
+                }
+
+            global_summary = None
+            global_targets_in = non_track_als_inventory.get("global")
+            if isinstance(global_targets_in, dict):
+                global_target_rows: Dict[str, Any] = {}
+                for key, value in (global_targets_in.get("targets") or {}).items():
+                    if not isinstance(key, str):
+                        continue
+                    probe_summary = _point_probe_summary(value)
+                    global_target_rows[key] = probe_summary
+                    coverage["global_point_queries"] += 1
+                    if probe_summary.get("envelope_exists") is True:
+                        coverage["global_envelopes_found"] += 1
+                global_summary = {
+                    "track_name": global_targets_in.get("track_name"),
+                    "targets": global_target_rows
+                }
+
+            non_track_als_summary = {
+                "ok": True,
+                "supported": True,
+                "als_file_path": non_track_als_inventory.get("als_file_path"),
+                "als_file_mtime_utc": non_track_als_inventory.get("als_file_mtime_utc"),
+                "warnings": list(non_track_als_inventory.get("warnings") or []) if isinstance(non_track_als_inventory.get("warnings"), list) else [],
+                "returns": returns_summary_rows,
+                "master": master_summary,
+                "global": global_summary,
+            }
+        else:
+            if isinstance(non_track_als_inventory, dict):
+                non_track_als_reason = _safe_text_value(non_track_als_inventory.get("reason")) or non_track_als_reason
+                non_track_als_summary = {
+                    "ok": True,
+                    "supported": False,
+                    "reason": non_track_als_reason or "als_unavailable",
+                    "als_file_path": non_track_als_inventory.get("als_file_path"),
+                    "warnings": list(non_track_als_inventory.get("warnings") or []) if isinstance(non_track_als_inventory.get("warnings"), list) else [],
+                }
+            else:
+                non_track_als_summary = {
+                    "ok": True,
+                    "supported": False,
+                    "reason": non_track_als_reason or "als_unavailable",
+                    "warnings": ["non_track_als_inventory_unavailable"],
+                }
+        returns_master_context = {
+            "returns": returns_payload,
+            "master": master_payload,
+            "automation_point_enumeration": {
+                "returns_supported": bool(isinstance(non_track_als_summary, dict) and non_track_als_summary.get("supported") is True),
+                "master_supported": bool(isinstance(non_track_als_summary, dict) and non_track_als_summary.get("supported") is True),
+                "global_supported": bool(isinstance(non_track_als_summary, dict) and non_track_als_summary.get("supported") is True),
+                "reason": non_track_als_reason,
+            },
+            "als_non_track_automation": non_track_als_summary,
+        }
+        if not (isinstance(non_track_als_summary, dict) and non_track_als_summary.get("supported") is True):
+            gaps.append({
+                "area": "return_master_automation",
+                "status": "partial",
+                "reason": non_track_als_reason or "return_master_automation_als_unavailable"
+            })
+            gaps.append({
+                "area": "global_song_automation",
+                "status": "partial",
+                "reason": non_track_als_reason or "global_song_automation_als_unavailable"
+            })
+        else:
+            gaps.append({
+                "area": "global_song_automation",
+                "status": "partial",
+                "reason": "only_tempo_and_time_signature_are_enumerated"
+            })
+    else:
+        gaps.append({
+            "area": "return_master_automation",
+            "status": "missing",
+            "reason": "include_return_master_context_false"
+        })
+        gaps.append({
+            "area": "global_song_automation",
+            "status": "missing",
+            "reason": "include_return_master_context_false"
+        })
+
+    gaps.append({
+        "area": "automation_unsaved_edits_visibility",
+        "status": "partial",
+        "reason": "als_fallback_reads_saved_set_only"
+    })
+
+    if coverage["device_parameter_als_mismatch_blocks"] > 0:
+        gaps.append({
+            "area": "device_parameter_arrangement_points",
+            "status": "partial",
+            "reason": "some_als_device_parameter_mappings_blocked_for_safety"
+        })
+
+    return {
+        "ok": True,
+        "supported": True,
+        "scope": "project_automation_inventory",
+        "session": {
+            "tempo": session_payload.get("tempo"),
+            "signature_numerator": session_payload.get("signature_numerator"),
+            "signature_denominator": session_payload.get("signature_denominator"),
+            "track_count": session_payload.get("track_count"),
+            "return_track_count": session_payload.get("return_track_count"),
+        },
+        "options": {
+            "track_indices": list(track_indices) if isinstance(track_indices, list) else None,
+            "als_file_path": als_file_path_value,
+            "include_arrangement_mixer_points": bool(include_arrangement_mixer_points),
+            "include_clip_envelopes": bool(include_clip_envelopes),
+            "include_device_parameter_points": bool(include_device_parameter_points),
+            "include_return_master_context": bool(include_return_master_context),
+            "max_clips_per_track": max_clips_value,
+            "sample_points": sample_points_value,
+            "start_time_beats": start_time_beats_value,
+            "end_time_beats": end_time_beats_value,
+            "include_point_payloads": bool(include_point_payloads),
+        },
+        "coverage": coverage,
+        "overview": {
+            "tracks_scanned": overview.get("tracks_scanned"),
+            "tracks_with_device_automation": overview.get("tracks_with_device_automation"),
+            "total_automated_parameters": overview.get("total_automated_parameters"),
+            "envelope_points_supported": overview.get("envelope_points_supported"),
+        },
+        "tracks": tracks_out,
+        "returns_master": returns_master_context,
+        "gaps": gaps,
+        "warnings": warnings,
+        "notes": [
+            "This tool broadens automation visibility by combining overview scans with targeted point probes.",
+            "Clip envelopes are only probed for discovered clips and selected candidate targets (mixer volume/pan + automated device params).",
+            "Arrangement device-parameter ALS fallback is safety-gated and may refuse ambiguous mappings."
         ]
     }
 
@@ -8014,6 +9362,607 @@ def build_mix_master_context(
         "missing_data_actions": missing_actions,
         "future_mutation_api_spec": future_mutation_api_spec
     }
+
+
+_ALS_EXHAUSTIVE_INVENTORY_CACHE_MAX_ENTRIES = 8
+_ALS_EXHAUSTIVE_INVENTORY_CACHE: Dict[str, Dict[str, Any]] = {}
+_ALS_EXHAUSTIVE_INVENTORY_CACHE_ORDER: List[str] = []
+
+
+def _normalized_cache_float(value: Any) -> Optional[float]:
+    parsed = _safe_float_value(value)
+    if parsed is None:
+        return None
+    return round(float(parsed), 6)
+
+
+def _als_exhaustive_inventory_cache_key(
+    als_file_path: Optional[str],
+    include_arrangement_clip_envelopes: bool,
+    include_session_clip_envelopes: bool,
+    start_time_beats: Optional[float],
+    end_time_beats: Optional[float],
+) -> Optional[str]:
+    path_value = _safe_text_value(als_file_path)
+    if not path_value:
+        return None
+    abs_path = os.path.abspath(os.path.expanduser(path_value))
+    try:
+        stat = os.stat(abs_path)
+    except Exception:
+        return None
+    payload = {
+        "kind": "als_exhaustive_inventory",
+        "als_file_path": abs_path,
+        "als_file_mtime_unix": round(float(stat.st_mtime), 6),
+        "als_file_size_bytes": int(stat.st_size),
+        "include_arrangement_clip_envelopes": bool(include_arrangement_clip_envelopes),
+        "include_session_clip_envelopes": bool(include_session_clip_envelopes),
+        "start_time_beats": _normalized_cache_float(start_time_beats),
+        "end_time_beats": _normalized_cache_float(end_time_beats),
+        "schema_version": 1,
+    }
+    digest = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return digest
+
+
+def _cache_put_als_exhaustive_inventory(cache_key: str, payload: Dict[str, Any]) -> None:
+    if not isinstance(cache_key, str) or not cache_key:
+        return
+    if not isinstance(payload, dict):
+        return
+    _ALS_EXHAUSTIVE_INVENTORY_CACHE[cache_key] = payload
+    if cache_key in _ALS_EXHAUSTIVE_INVENTORY_CACHE_ORDER:
+        _ALS_EXHAUSTIVE_INVENTORY_CACHE_ORDER.remove(cache_key)
+    _ALS_EXHAUSTIVE_INVENTORY_CACHE_ORDER.append(cache_key)
+    while len(_ALS_EXHAUSTIVE_INVENTORY_CACHE_ORDER) > _ALS_EXHAUSTIVE_INVENTORY_CACHE_MAX_ENTRIES:
+        evicted = _ALS_EXHAUSTIVE_INVENTORY_CACHE_ORDER.pop(0)
+        _ALS_EXHAUSTIVE_INVENTORY_CACHE.pop(evicted, None)
+
+
+def _als_exhaustive_inventory_disk_cache_path(cache_key: str) -> Optional[str]:
+    if not isinstance(cache_key, str) or not cache_key:
+        return None
+    try:
+        analysis_dir = get_analysis_dir()
+    except Exception:
+        return None
+    if not isinstance(analysis_dir, str) or not analysis_dir:
+        return None
+    cache_dir = os.path.join(analysis_dir, "automation_inventory_cache")
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except Exception:
+        return None
+    return os.path.join(cache_dir, f"{cache_key}.json")
+
+
+def _cache_get_als_exhaustive_inventory_disk(cache_key: str) -> Optional[Dict[str, Any]]:
+    cache_path = _als_exhaustive_inventory_disk_cache_path(cache_key)
+    if not cache_path or not os.path.isfile(cache_path):
+        return None
+    try:
+        with open(cache_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        return None
+    return None
+
+
+def _cache_put_als_exhaustive_inventory_disk(cache_key: str, payload: Dict[str, Any]) -> Optional[str]:
+    cache_path = _als_exhaustive_inventory_disk_cache_path(cache_key)
+    if not cache_path or not isinstance(payload, dict):
+        return None
+    try:
+        temp_path = cache_path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=True)
+        os.replace(temp_path, cache_path)
+        return cache_path
+    except Exception:
+        try:
+            if 'temp_path' in locals() and os.path.exists(temp_path):
+                os.unlink(temp_path)
+        except Exception:
+            pass
+        return None
+
+
+def _build_or_get_als_exhaustive_inventory(
+    *,
+    project_root: Optional[str],
+    als_file_path: Optional[str],
+    include_arrangement_clip_envelopes: bool,
+    include_session_clip_envelopes: bool,
+    start_time_beats: Optional[float],
+    end_time_beats: Optional[float],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    requested_cache_key = _als_exhaustive_inventory_cache_key(
+        als_file_path=als_file_path,
+        include_arrangement_clip_envelopes=include_arrangement_clip_envelopes,
+        include_session_clip_envelopes=include_session_clip_envelopes,
+        start_time_beats=start_time_beats,
+        end_time_beats=end_time_beats,
+    )
+    if requested_cache_key and requested_cache_key in _ALS_EXHAUSTIVE_INVENTORY_CACHE:
+        return _ALS_EXHAUSTIVE_INVENTORY_CACHE[requested_cache_key], {
+            "cache_hit": True,
+            "cache_key": requested_cache_key,
+            "cache_layer": "process_memory",
+        }
+    if requested_cache_key:
+        disk_payload = _cache_get_als_exhaustive_inventory_disk(requested_cache_key)
+        if isinstance(disk_payload, dict):
+            _cache_put_als_exhaustive_inventory(requested_cache_key, disk_payload)
+            return disk_payload, {
+                "cache_hit": True,
+                "cache_key": requested_cache_key,
+                "cache_layer": "analysis_disk",
+            }
+
+    inventory = build_als_automation_inventory(
+        project_root=project_root,
+        als_file_path=als_file_path,
+        include_arrangement_clip_envelopes=include_arrangement_clip_envelopes,
+        include_session_clip_envelopes=include_session_clip_envelopes,
+        start_time_beats=start_time_beats,
+        end_time_beats=end_time_beats,
+    )
+    if not isinstance(inventory, dict):
+        return {
+            "ok": False,
+            "supported": False,
+            "error": "invalid_inventory_payload",
+            "message": "build_als_automation_inventory returned invalid payload",
+        }, {"cache_hit": False}
+
+    resolved_key = _als_exhaustive_inventory_cache_key(
+        als_file_path=_safe_text_value(inventory.get("als_file_path")),
+        include_arrangement_clip_envelopes=include_arrangement_clip_envelopes,
+        include_session_clip_envelopes=include_session_clip_envelopes,
+        start_time_beats=start_time_beats,
+        end_time_beats=end_time_beats,
+    )
+    if resolved_key and inventory.get("supported") is True:
+        _cache_put_als_exhaustive_inventory(resolved_key, inventory)
+        _cache_put_als_exhaustive_inventory_disk(resolved_key, inventory)
+    return inventory, {
+        "cache_hit": False,
+        "cache_key": resolved_key,
+        "cache_layer": "process_memory" if resolved_key else None,
+    }
+
+
+def _parse_page_cursor(cursor: Optional[str]) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
+    if cursor is None:
+        return 0, None
+    if isinstance(cursor, int):
+        value = int(cursor)
+    elif isinstance(cursor, str):
+        text = cursor.strip()
+        if not text:
+            return 0, None
+        if not re.fullmatch(r"\d+", text):
+            return None, {
+                "ok": False,
+                "error": "invalid_cursor",
+                "message": "cursor must be a non-negative integer string",
+                "cursor": cursor,
+            }
+        value = int(text)
+    else:
+        return None, {
+            "ok": False,
+            "error": "invalid_cursor",
+            "message": "cursor must be a string offset",
+            "cursor": cursor,
+        }
+    if value < 0:
+        return None, {
+            "ok": False,
+            "error": "invalid_cursor",
+            "message": "cursor must be non-negative",
+            "cursor": cursor,
+        }
+    return value, None
+
+
+def _sanitize_exhaustive_inventory_row(row: Dict[str, Any], include_point_payloads: bool) -> Dict[str, Any]:
+    out = copy.deepcopy(row) if isinstance(row, dict) else {}
+    if include_point_payloads:
+        return out
+    out.pop("points", None)
+    return out
+
+
+def _build_exhaustive_runtime_hint_index(
+    ctx: Context,
+    page_rows: List[Dict[str, Any]],
+) -> Tuple[Dict[int, Dict[str, Any]], List[str]]:
+    track_indices_needed: List[int] = []
+    seen_track_indices = set()
+    for row in page_rows:
+        if not isinstance(row, dict):
+            continue
+        if (_safe_text_value(row.get("container_scope")) or "") != "track":
+            continue
+        classification = row.get("classification") if isinstance(row.get("classification"), dict) else {}
+        scope_value = _safe_text_value(classification.get("scope"))
+        if scope_value not in {"device_parameter", "track_mixer"}:
+            continue
+        location = row.get("location") if isinstance(row.get("location"), dict) else {}
+        track_index_value = _safe_int_value(location.get("track_index"))
+        if track_index_value is None or track_index_value < 0 or track_index_value in seen_track_indices:
+            continue
+        seen_track_indices.add(track_index_value)
+        track_indices_needed.append(track_index_value)
+
+    runtime_index: Dict[int, Dict[str, Any]] = {}
+    warnings: List[str] = []
+    for track_index_value in track_indices_needed:
+        try:
+            payload = get_track_automation_targets(ctx, track_index_value)
+        except Exception as exc:
+            warnings.append(f"live_hint_track_query_exception:{track_index_value}")
+            runtime_index[track_index_value] = {
+                "ok": False,
+                "error": "exception",
+                "message": str(exc),
+            }
+            continue
+
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            warnings.append(f"live_hint_track_query_failed:{track_index_value}")
+            runtime_index[track_index_value] = payload if isinstance(payload, dict) else {
+                "ok": False,
+                "error": "invalid_track_automation_targets_payload",
+            }
+            continue
+
+        devices_index: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        for device in list(payload.get("devices") or []):
+            if not isinstance(device, dict):
+                continue
+            device_index_value = _safe_int_value(device.get("device_index"))
+            if device_index_value is None:
+                continue
+            for param in list(device.get("parameters") or []):
+                if not isinstance(param, dict):
+                    continue
+                parameter_index_value = _safe_int_value(param.get("parameter_index"))
+                if parameter_index_value is None:
+                    continue
+                devices_index[(int(device_index_value), int(parameter_index_value))] = param
+
+        runtime_index[track_index_value] = {
+            "ok": True,
+            "track_name": payload.get("track_name"),
+            "track_mixer_targets": payload.get("track_mixer_targets") if isinstance(payload.get("track_mixer_targets"), dict) else {},
+            "device_parameters": devices_index,
+        }
+    return runtime_index, warnings
+
+
+def _attach_exhaustive_live_hints_to_row(
+    row: Dict[str, Any],
+    runtime_index: Dict[int, Dict[str, Any]],
+) -> None:
+    if not isinstance(row, dict):
+        return
+    classification = row.get("classification") if isinstance(row.get("classification"), dict) else {}
+    location = row.get("location") if isinstance(row.get("location"), dict) else {}
+    container_scope = (_safe_text_value(row.get("container_scope")) or "").lower()
+    classification_scope = (_safe_text_value(classification.get("scope")) or "").lower()
+
+    def _set_hint(payload: Dict[str, Any]) -> None:
+        row["live_hints"] = payload
+
+    if container_scope != "track":
+        _set_hint({
+            "available": False,
+            "mapping_confidence": "none",
+            "unsaved_risk": "unknown",
+            "reason": "non_track_runtime_hint_overlay_not_implemented",
+        })
+        return
+
+    track_index_value = _safe_int_value(location.get("track_index"))
+    if track_index_value is None:
+        _set_hint({
+            "available": False,
+            "mapping_confidence": "none",
+            "unsaved_risk": "unknown",
+            "reason": "track_index_unavailable",
+        })
+        return
+
+    runtime_track = runtime_index.get(track_index_value)
+    if not isinstance(runtime_track, dict) or runtime_track.get("ok") is not True:
+        _set_hint({
+            "available": False,
+            "mapping_confidence": "none",
+            "unsaved_risk": "unknown",
+            "reason": "track_runtime_automation_targets_unavailable",
+        })
+        return
+
+    if classification_scope == "track_mixer":
+        mixer_target = _safe_text_value(classification.get("mixer_target"))
+        track_mixer_targets = runtime_track.get("track_mixer_targets") if isinstance(runtime_track.get("track_mixer_targets"), dict) else {}
+        mixer_payload = track_mixer_targets.get(mixer_target) if isinstance(track_mixer_targets, dict) and isinstance(mixer_target, str) else None
+        if not isinstance(mixer_payload, dict):
+            _set_hint({
+                "available": False,
+                "mapping_confidence": "none",
+                "unsaved_risk": "unknown",
+                "reason": "track_mixer_runtime_hint_missing",
+            })
+            return
+        _set_hint({
+            "available": bool(mixer_payload.get("supported", False)) if "supported" in mixer_payload else False,
+            "mapping_confidence": "high",
+            "unsaved_risk": "unknown",
+            "automation_state": mixer_payload.get("automation_state"),
+            "automated": mixer_payload.get("automated"),
+            "reason": mixer_payload.get("reason"),
+        })
+        return
+
+    if classification_scope == "device_parameter":
+        legacy_device_index = _safe_int_value(classification.get("legacy_top_level_device_index"))
+        legacy_parameter_index = _safe_int_value(classification.get("legacy_top_level_parameter_index"))
+        if legacy_device_index is None or legacy_parameter_index is None:
+            _set_hint({
+                "available": False,
+                "mapping_confidence": "none",
+                "unsaved_risk": "unknown",
+                "reason": "legacy_top_level_mapping_unavailable",
+            })
+            return
+        param_payload = (runtime_track.get("device_parameters") or {}).get((int(legacy_device_index), int(legacy_parameter_index)))
+        if not isinstance(param_payload, dict):
+            _set_hint({
+                "available": False,
+                "mapping_confidence": "low",
+                "unsaved_risk": "unknown",
+                "reason": "runtime_parameter_not_found",
+                "legacy_top_level_device_index": legacy_device_index,
+                "legacy_top_level_parameter_index": legacy_parameter_index,
+            })
+            return
+        _set_hint({
+            "available": True,
+            "mapping_confidence": "high",
+            "unsaved_risk": "unknown",
+            "automation_state": param_payload.get("automation_state"),
+            "automated": param_payload.get("automated"),
+            "parameter_index": param_payload.get("parameter_index"),
+            "parameter_name": param_payload.get("name"),
+            "legacy_top_level_device_index": legacy_device_index,
+            "legacy_top_level_parameter_index": legacy_parameter_index,
+        })
+        return
+
+    _set_hint({
+        "available": False,
+        "mapping_confidence": "none",
+        "unsaved_risk": "unknown",
+        "reason": "runtime_hint_not_supported_for_scope",
+        "classification_scope": classification_scope or None,
+    })
+
+
+def _attach_exhaustive_live_hints(
+    ctx: Context,
+    rows: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    runtime_index, warnings = _build_exhaustive_runtime_hint_index(ctx, rows)
+    for row in rows:
+        _attach_exhaustive_live_hints_to_row(row, runtime_index)
+    return rows, warnings
+
+
+@mcp.tool()
+def enumerate_project_automation_exhaustive(
+    ctx: Context,
+    als_file_path: Optional[str] = None,
+    include_point_payloads: bool = False,
+    include_live_hints: bool = True,
+    include_arrangement_clip_envelopes: bool = True,
+    include_session_clip_envelopes: bool = True,
+    include_unclassified: bool = True,
+    include_orphans: bool = True,
+    start_time_beats: Optional[float] = None,
+    end_time_beats: Optional[float] = None,
+    page_size: int = 500,
+    cursor: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Exhaustive, ALS-first saved-state automation inventory (paged).
+
+    This tool is the canonical exact inventory for automation visibility in the current milestone.
+
+    Parameters:
+    - include_arrangement_clip_envelopes: include arrangement clip envelope rows
+    - include_session_clip_envelopes: include session clip envelope rows
+    """
+    _ = ctx
+    page_size_value = _safe_int_value(page_size)
+    if page_size_value is None:
+        page_size_value = 500
+    page_size_value = max(1, min(int(page_size_value), 5000))
+
+    cursor_offset, cursor_error = _parse_page_cursor(cursor)
+    if cursor_error is not None:
+        return cursor_error
+    cursor_offset = int(cursor_offset or 0)
+
+    inventory, cache_meta = _build_or_get_als_exhaustive_inventory(
+        project_root=get_project_root(),
+        als_file_path=_safe_text_value(als_file_path),
+        include_arrangement_clip_envelopes=bool(include_arrangement_clip_envelopes),
+        include_session_clip_envelopes=bool(include_session_clip_envelopes),
+        start_time_beats=_safe_float_value(start_time_beats),
+        end_time_beats=_safe_float_value(end_time_beats),
+    )
+    if not isinstance(inventory, dict):
+        return {
+            "ok": False,
+            "error": "invalid_inventory_payload",
+            "message": "ALS automation inventory builder returned invalid payload",
+        }
+
+    all_targets = list(inventory.get("targets") or []) if isinstance(inventory.get("targets"), list) else []
+    total_targets = len(all_targets)
+    start_index = min(cursor_offset, total_targets)
+    end_index = min(start_index + page_size_value, total_targets)
+    page_rows = [
+        _sanitize_exhaustive_inventory_row(row, include_point_payloads=bool(include_point_payloads))
+        for row in all_targets[start_index:end_index]
+        if isinstance(row, dict)
+    ]
+
+    warnings = list(inventory.get("warnings") or []) if isinstance(inventory.get("warnings"), list) else []
+    if bool(include_live_hints):
+        try:
+            page_rows, live_warnings = _attach_exhaustive_live_hints(ctx, page_rows)
+            for warning in live_warnings:
+                if isinstance(warning, str) and warning not in warnings:
+                    warnings.append(warning)
+        except Exception as exc:
+            if "exhaustive_live_hint_overlay_failed" not in warnings:
+                warnings.append("exhaustive_live_hint_overlay_failed")
+            warnings.append(f"exhaustive_live_hint_overlay_error:{str(exc)}")
+
+    next_cursor = str(end_index) if end_index < total_targets else None
+    page_payload = {
+        "page_size": page_size_value,
+        "cursor": str(start_index),
+        "next_cursor": next_cursor,
+        "returned_targets": len(page_rows),
+        "total_targets": total_targets,
+    }
+
+    out: Dict[str, Any] = {
+        "ok": bool(inventory.get("ok", False)),
+        "supported": bool(inventory.get("supported", False)) if "supported" in inventory else False,
+        "schema_version": inventory.get("schema_version"),
+        "source": inventory.get("source", "als_file"),
+        "als_file_path": inventory.get("als_file_path"),
+        "als_file_mtime_utc": inventory.get("als_file_mtime_utc"),
+        "scope_statement": inventory.get("scope_statement"),
+        "session": inventory.get("session"),
+        "completeness": inventory.get("completeness"),
+        "page": page_payload,
+        "targets": page_rows,
+        "warnings": warnings,
+    }
+    if "reason" in inventory:
+        out["reason"] = inventory.get("reason")
+    if bool(include_orphans):
+        out["orphan_envelopes"] = list(inventory.get("orphan_envelopes") or []) if isinstance(inventory.get("orphan_envelopes"), list) else []
+    if bool(include_unclassified):
+        out["unclassified_targets"] = list(inventory.get("unclassified_targets") or []) if isinstance(inventory.get("unclassified_targets"), list) else []
+    if isinstance(inventory.get("duplicate_target_id_rows"), list):
+        out["duplicate_target_id_rows"] = list(inventory.get("duplicate_target_id_rows") or [])
+    if isinstance(cache_meta, dict):
+        out["cache"] = {
+            "cache_hit": bool(cache_meta.get("cache_hit", False)),
+            "cache_layer": cache_meta.get("cache_layer"),
+        }
+    if bool(include_live_hints):
+        out["live_hints_included"] = True
+    return out
+
+
+@mcp.tool()
+def get_automation_target_points(
+    ctx: Context,
+    target_ref: Dict[str, Any],
+    als_file_path: Optional[str] = None,
+    include_live_hints: bool = False,
+    start_time_beats: Optional[float] = None,
+    end_time_beats: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Return exact saved automation points for one target discovered by enumerate_project_automation_exhaustive.
+
+    Parameters:
+    - target_ref: canonical target reference object from enumerate_project_automation_exhaustive
+    - als_file_path: optional explicit .als file path
+    - include_live_hints: include best-effort runtime hints (top-level normal-track mappings only)
+    - start_time_beats/end_time_beats: optional beat-range filter applied during ALS inventory build
+    """
+    if not isinstance(target_ref, dict):
+        return {
+            "ok": False,
+            "error": "invalid_target_ref",
+            "message": "target_ref must be an object"
+        }
+
+    inventory, cache_meta = _build_or_get_als_exhaustive_inventory(
+        project_root=get_project_root(),
+        als_file_path=_safe_text_value(als_file_path),
+        include_arrangement_clip_envelopes=True,
+        include_session_clip_envelopes=True,
+        start_time_beats=_safe_float_value(start_time_beats),
+        end_time_beats=_safe_float_value(end_time_beats),
+    )
+    if not isinstance(inventory, dict):
+        return {
+            "ok": False,
+            "error": "invalid_inventory_payload",
+            "message": "ALS automation inventory builder returned invalid payload",
+        }
+    if inventory.get("supported") is not True:
+        return {
+            "ok": True,
+            "supported": False,
+            "reason": inventory.get("reason") or "als_inventory_unavailable",
+            "target_ref": target_ref,
+            "als_file_path": inventory.get("als_file_path"),
+            "warnings": list(inventory.get("warnings") or []) if isinstance(inventory.get("warnings"), list) else [],
+        }
+
+    resolved = get_als_automation_target_points_from_inventory(inventory, target_ref)
+    if not isinstance(resolved, dict):
+        return {
+            "ok": False,
+            "error": "invalid_target_resolution_payload",
+            "message": "ALS target resolution helper returned invalid payload",
+        }
+
+    out = dict(resolved)
+    out.setdefault("source", "als_inventory")
+    out["als_file_path"] = inventory.get("als_file_path")
+    out["als_file_mtime_utc"] = inventory.get("als_file_mtime_utc")
+    out["scope_statement"] = inventory.get("scope_statement")
+    if isinstance(cache_meta, dict):
+        out["cache"] = {
+            "cache_hit": bool(cache_meta.get("cache_hit", False)),
+            "cache_layer": cache_meta.get("cache_layer"),
+        }
+
+    if bool(include_live_hints) and out.get("ok") is True:
+        row_like = {
+            "container_scope": out.get("container_scope"),
+            "classification": out.get("classification"),
+            "location": out.get("location"),
+        }
+        runtime_index, live_warnings = _build_exhaustive_runtime_hint_index(ctx, [row_like])
+        _attach_exhaustive_live_hints_to_row(row_like, runtime_index)
+        out["live_hints"] = row_like.get("live_hints")
+        if live_warnings:
+            warnings = list(out.get("warnings") or []) if isinstance(out.get("warnings"), list) else []
+            for warning in live_warnings:
+                if isinstance(warning, str) and warning not in warnings:
+                    warnings.append(warning)
+            out["warnings"] = warnings
+        out["live_hints_included"] = True
+
+    return out
 
 # Main execution
 def main():

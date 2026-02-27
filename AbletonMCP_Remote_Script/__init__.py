@@ -272,6 +272,21 @@ class AbletonMCP(ControlSurface):
                     end_time_beats=params.get("end_time_beats", None),
                     sample_points=params.get("sample_points", 0)
                 )
+            elif command_type == "get_clip_automation_envelope_points":
+                response["result"] = self._get_clip_automation_envelope_points(
+                    track_index=params.get("track_index", 0),
+                    clip_scope=params.get("clip_scope", "session"),
+                    clip_slot_index=params.get("clip_slot_index", None),
+                    clip_index=params.get("clip_index", None),
+                    scope=params.get("scope", "device_parameter"),
+                    mixer_target=params.get("mixer_target", "volume"),
+                    send_index=params.get("send_index", None),
+                    device_index=params.get("device_index", None),
+                    parameter_index=params.get("parameter_index", None),
+                    start_time_beats=params.get("start_time_beats", None),
+                    end_time_beats=params.get("end_time_beats", None),
+                    sample_points=params.get("sample_points", 0)
+                )
             # Commands that modify Live's state should be scheduled on the main thread
             elif command_type in ["create_midi_track", "set_track_name", 
                                  "create_clip", "add_notes_to_clip", "set_clip_name", 
@@ -1970,6 +1985,347 @@ class AbletonMCP(ControlSurface):
             "track_index": track_index,
             "scope": scope
         }
+
+    def _resolve_clip_for_automation_envelope(
+        self,
+        track_index,
+        clip_scope="session",
+        clip_slot_index=None,
+        clip_index=None
+    ):
+        """Resolve a clip object (session/arrangement) for clip-envelope lookup."""
+        song, track, error_payload = self._resolve_track_by_index(track_index)
+        if error_payload is not None:
+            return None, None, None, error_payload
+
+        clip_scope_key = (self._safe_text(clip_scope) or "session").lower()
+        track_name = self._safe_text(self._safe_attr(track, "name"))
+
+        if clip_scope_key in ("session", "session_view"):
+            slot_idx = self._safe_int_param(clip_slot_index)
+            if slot_idx is None or slot_idx < 0:
+                return song, track, None, {
+                    "ok": False,
+                    "error": "invalid_clip_slot_index",
+                    "message": "clip_slot_index must be a non-negative integer for clip_scope='session'",
+                    "track_index": track_index,
+                    "track_name": track_name,
+                    "clip_scope": "session",
+                    "clip_slot_index": clip_slot_index
+                }
+
+            clip_slots = self._to_list(self._safe_attr(track, "clip_slots"))
+            if not isinstance(clip_slots, list):
+                clip_slots = []
+            if slot_idx >= len(clip_slots):
+                return song, track, None, {
+                    "ok": False,
+                    "error": "invalid_clip_slot_index",
+                    "message": "clip_slot_index out of range",
+                    "track_index": track_index,
+                    "track_name": track_name,
+                    "clip_scope": "session",
+                    "clip_slot_index": int(slot_idx),
+                    "clip_slot_count": len(clip_slots)
+                }
+
+            slot = clip_slots[slot_idx]
+            has_clip = self._safe_attr(slot, "has_clip")
+            if has_clip is not True:
+                return song, track, None, {
+                    "ok": False,
+                    "error": "no_clip_in_slot",
+                    "message": "Session clip slot does not contain a clip",
+                    "track_index": track_index,
+                    "track_name": track_name,
+                    "clip_scope": "session",
+                    "clip_slot_index": int(slot_idx)
+                }
+
+            clip = self._safe_attr(slot, "clip")
+            if clip is None:
+                return song, track, None, {
+                    "ok": False,
+                    "error": "clip_unavailable",
+                    "message": "Could not access clip in session slot",
+                    "track_index": track_index,
+                    "track_name": track_name,
+                    "clip_scope": "session",
+                    "clip_slot_index": int(slot_idx)
+                }
+
+            clip_payload = {
+                "clip_scope": "session",
+                "clip_slot_index": int(slot_idx)
+            }
+            clip_payload.update(self._clip_metadata(clip, int(slot_idx)))
+            return song, track, clip, clip_payload
+
+        if clip_scope_key in ("arrangement", "arranger"):
+            arr_idx = self._safe_int_param(clip_index)
+            if arr_idx is None or arr_idx < 0:
+                return song, track, None, {
+                    "ok": False,
+                    "error": "invalid_clip_index",
+                    "message": "clip_index must be a non-negative integer for clip_scope='arrangement'",
+                    "track_index": track_index,
+                    "track_name": track_name,
+                    "clip_scope": "arrangement",
+                    "clip_index": clip_index
+                }
+
+            arrangement_raw = self._safe_attr(track, "arrangement_clips")
+            arrangement_clips = self._to_list(arrangement_raw)
+            if not isinstance(arrangement_clips, list):
+                arrangement_clips = []
+            if arr_idx >= len(arrangement_clips):
+                return song, track, None, {
+                    "ok": False,
+                    "error": "invalid_clip_index",
+                    "message": "clip_index out of range",
+                    "track_index": track_index,
+                    "track_name": track_name,
+                    "clip_scope": "arrangement",
+                    "clip_index": int(arr_idx),
+                    "arrangement_clip_count": len(arrangement_clips)
+                }
+
+            clip = arrangement_clips[arr_idx]
+            if clip is None:
+                return song, track, None, {
+                    "ok": False,
+                    "error": "clip_unavailable",
+                    "message": "Could not access arrangement clip",
+                    "track_index": track_index,
+                    "track_name": track_name,
+                    "clip_scope": "arrangement",
+                    "clip_index": int(arr_idx)
+                }
+
+            clip_payload = {
+                "clip_scope": "arrangement",
+                "clip_index": int(arr_idx)
+            }
+            clip_payload.update(self._clip_metadata(clip, int(arr_idx)))
+            return song, track, clip, clip_payload
+
+        return song, track, None, {
+            "ok": False,
+            "error": "invalid_clip_scope",
+            "message": "clip_scope must be 'session' or 'arrangement'",
+            "track_index": track_index,
+            "track_name": track_name,
+            "clip_scope": clip_scope
+        }
+
+    def _infer_clip_envelope_time_range_beats(self, clip, clip_payload):
+        """Best-effort clip-local timeline range for clip envelope sampling."""
+        if not isinstance(clip_payload, dict):
+            clip_payload = {}
+
+        length_beats = self._safe_float_param(clip_payload.get("length_beats"))
+        start_time_beats = self._safe_float_param(clip_payload.get("start_time_beats"))
+        end_time_beats = self._safe_float_param(clip_payload.get("end_time_beats"))
+        clip_scope = (self._safe_text(clip_payload.get("clip_scope")) or "").lower()
+
+        if clip_scope == "session":
+            # Session clip envelopes are clip-local; start at 0 when possible.
+            if isinstance(length_beats, float) and length_beats >= 0.0:
+                return 0.0, float(length_beats)
+            return 0.0, None
+
+        if clip_scope == "arrangement":
+            if isinstance(start_time_beats, float) and isinstance(end_time_beats, float):
+                return start_time_beats, end_time_beats
+            if isinstance(start_time_beats, float) and isinstance(length_beats, float):
+                return start_time_beats, float(start_time_beats) + float(length_beats)
+
+        # Fallback to any explicit clip-level loop range-ish attributes if available.
+        for start_attr, end_attr in [("loop_start", "loop_end"), ("start_marker", "end_marker")]:
+            start_value = self._safe_float_param(self._safe_attr(clip, start_attr))
+            end_value = self._safe_float_param(self._safe_attr(clip, end_attr))
+            if isinstance(start_value, float) and isinstance(end_value, float):
+                if end_value < start_value:
+                    end_value = start_value
+                return start_value, end_value
+
+        if isinstance(start_time_beats, float) and isinstance(end_time_beats, float):
+            if end_time_beats < start_time_beats:
+                end_time_beats = start_time_beats
+            return start_time_beats, end_time_beats
+
+        return None, None
+
+    def _get_clip_automation_envelope_points(
+        self,
+        track_index,
+        clip_scope="session",
+        clip_slot_index=None,
+        clip_index=None,
+        scope="device_parameter",
+        mixer_target="volume",
+        send_index=None,
+        device_index=None,
+        parameter_index=None,
+        start_time_beats=None,
+        end_time_beats=None,
+        sample_points=0
+    ):
+        """Best-effort clip automation envelope point read for a session/arrangement clip."""
+        track_idx = self._safe_int_param(track_index)
+        if track_idx is None:
+            return {
+                "ok": False,
+                "error": "invalid_track_index",
+                "message": "track_index must be an integer",
+                "track_index": track_index
+            }
+
+        song, track, clip, clip_or_error = self._resolve_clip_for_automation_envelope(
+            track_index=track_idx,
+            clip_scope=clip_scope,
+            clip_slot_index=clip_slot_index,
+            clip_index=clip_index
+        )
+        if clip is None:
+            if isinstance(clip_or_error, dict):
+                return clip_or_error
+            return {
+                "ok": False,
+                "error": "clip_resolution_failed",
+                "message": "Could not resolve clip for automation envelope lookup",
+                "track_index": track_idx,
+                "clip_scope": clip_scope
+            }
+
+        clip_payload = clip_or_error if isinstance(clip_or_error, dict) else {}
+        track_name = self._safe_text(self._safe_attr(track, "name"))
+
+        _, parameter, target_or_error = self._resolve_automation_target_parameter(
+            song=song,
+            track_index=track_idx,
+            scope=scope,
+            mixer_target=mixer_target,
+            send_index=send_index,
+            device_index=device_index,
+            parameter_index=parameter_index
+        )
+        if parameter is None:
+            if isinstance(target_or_error, dict):
+                # Preserve clip context on target resolution failures.
+                error_payload = dict(target_or_error)
+                error_payload["clip_scope"] = clip_payload.get("clip_scope")
+                if clip_payload.get("clip_slot_index") is not None:
+                    error_payload["clip_slot_index"] = clip_payload.get("clip_slot_index")
+                if clip_payload.get("clip_index") is not None:
+                    error_payload["clip_index"] = clip_payload.get("clip_index")
+                error_payload["clip_name"] = clip_payload.get("clip_name")
+                return error_payload
+            return {
+                "ok": False,
+                "error": "automation_target_resolution_failed",
+                "message": "Could not resolve automation parameter target",
+                "track_index": track_idx,
+                "clip_scope": clip_payload.get("clip_scope")
+            }
+
+        target_payload = target_or_error if isinstance(target_or_error, dict) else {}
+        automation_state = self._serialize_parameter_automation_state(parameter)
+
+        result = {
+            "ok": True,
+            "supported": True,
+            "track_index": int(track_idx),
+            "track_name": track_name,
+            "clip_scope": clip_payload.get("clip_scope"),
+            "clip": clip_payload,
+            "target": target_payload,
+            "automation_state": automation_state,
+            "envelope_exists": False,
+            "point_access_supported": False,
+            "points": [],
+            "sampled_series": [],
+            "warnings": []
+        }
+        if clip_payload.get("clip_slot_index") is not None:
+            result["clip_slot_index"] = clip_payload.get("clip_slot_index")
+        if clip_payload.get("clip_index") is not None:
+            result["clip_index"] = clip_payload.get("clip_index")
+        if clip_payload.get("clip_name") is not None:
+            result["clip_name"] = clip_payload.get("clip_name")
+
+        envelope_getter = self._safe_attr(clip, "automation_envelope")
+        if not callable(envelope_getter):
+            result["supported"] = False
+            result["reason"] = "clip_automation_envelope_unavailable"
+            result["warnings"].append("clip_automation_envelope_unavailable")
+            return result
+
+        try:
+            envelope = envelope_getter(parameter)
+        except Exception as exc:
+            result["supported"] = False
+            result["reason"] = "clip_automation_envelope_lookup_failed"
+            result["message"] = str(exc)
+            result["warnings"].append("clip_automation_envelope_lookup_failed")
+            return result
+
+        if envelope is None:
+            result["envelope_exists"] = False
+            if (self._safe_text(clip_payload.get("clip_scope")) or "").lower() == "arrangement":
+                result["warnings"].append("arrangement_clip_automation_envelope_returns_none")
+            return result
+
+        result["envelope_exists"] = True
+        result["envelope_class_name"] = self._safe_text(self._safe_attr(envelope, "class_name")) or self._safe_text(type(envelope).__name__)
+
+        direct = self._extract_envelope_points_best_effort(envelope)
+        if isinstance(direct, dict):
+            result["point_access_supported"] = bool(direct.get("point_access_supported"))
+            result["points"] = direct.get("points", []) if isinstance(direct.get("points"), list) else []
+            if direct.get("source"):
+                result["point_source"] = direct.get("source")
+            if direct.get("source_kind"):
+                result["point_source_kind"] = direct.get("source_kind")
+            if isinstance(direct.get("warnings"), list):
+                result["warnings"].extend(direct.get("warnings"))
+
+        sample_count = self._safe_int_param(sample_points)
+        if (
+            (not isinstance(result.get("points"), list) or len(result.get("points", [])) == 0)
+            and isinstance(sample_count, int) and sample_count > 1
+        ):
+            start_value = self._safe_float_param(start_time_beats)
+            end_value = self._safe_float_param(end_time_beats)
+            if start_value is None or end_value is None:
+                inferred_start, inferred_end = self._infer_clip_envelope_time_range_beats(clip, clip_payload)
+                if start_value is None:
+                    start_value = inferred_start
+                if end_value is None:
+                    end_value = inferred_end
+
+            sample_payload = self._sample_envelope_values(
+                envelope=envelope,
+                start_time_beats=start_value,
+                end_time_beats=end_value,
+                sample_points=sample_count
+            )
+            if isinstance(sample_payload, dict):
+                if bool(sample_payload.get("supported")):
+                    result["sampled_series"] = sample_payload.get("samples", [])
+                    result["sampled_series_kind"] = "value_at_time"
+                    result["sampled_range_beats"] = {
+                        "start": start_value,
+                        "end": end_value
+                    }
+                else:
+                    sample_reason = sample_payload.get("reason")
+                    if sample_reason:
+                        result["warnings"].append("sampled_series_unavailable:{0}".format(sample_reason))
+                    if sample_payload.get("message"):
+                        result["sampled_series_error"] = sample_payload.get("message")
+
+        return result
 
     def _get_automation_envelope_points(
         self,

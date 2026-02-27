@@ -47,6 +47,9 @@ class _FakeAbletonConnection:
 class ExportWorkflowTests(unittest.TestCase):
     def test_bootstrap_creates_project_dirs_and_agents_md(self):
         with tempfile.TemporaryDirectory() as tmpdir:
+            # Mark temp folder as an Ableton project so AGENTS.md bootstrap is allowed.
+            with open(os.path.join(tmpdir, "DemoSong.als"), "w", encoding="utf-8") as handle:
+                handle.write("placeholder")
             with mock.patch.dict(
                 os.environ,
                 {
@@ -66,6 +69,27 @@ class ExportWorkflowTests(unittest.TestCase):
                 self.assertTrue(os.path.isdir(os.path.join(tmpdir, "AbletonMCP", "exports")))
                 self.assertTrue(os.path.isdir(os.path.join(tmpdir, "AbletonMCP", "analysis")))
                 self.assertTrue(os.path.exists(project_agents_path))
+
+    def test_bootstrap_skips_agents_md_in_non_ableton_project_folders(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "PROJECT_ROOT": tmpdir,
+                    "EXPORT_ROOT_MODE": "project",
+                    "EXPORT_REL_DIR": "AbletonMCP/exports",
+                    "ANALYSIS_REL_DIR": "AbletonMCP/analysis",
+                },
+                clear=False,
+            ):
+                result = pathing.bootstrap_project_environment()
+
+            self.assertTrue(result["ok"])
+            self.assertTrue(os.path.isdir(os.path.join(tmpdir, "AbletonMCP", "exports")))
+            self.assertTrue(os.path.isdir(os.path.join(tmpdir, "AbletonMCP", "analysis")))
+            self.assertFalse(os.path.exists(os.path.join(tmpdir, "AGENTS.md")))
+            self.assertEqual(result["agents"]["reason"], "not_ableton_project_folder")
+            self.assertFalse(result["agents"]["copied"])
 
     def test_plan_exports_writes_manifest_under_project_dirs(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -49,6 +49,78 @@ def get_repo_root() -> str:
     return str(Path(__file__).resolve().parent.parent)
 
 
+def _looks_like_ableton_project_root(project_root: str) -> Dict[str, Any]:
+    """
+    Heuristic detection for an Ableton project folder.
+
+    We only want to auto-bootstrap a project-local AGENTS.md when AbletonMCP is being
+    used inside an actual music project, not arbitrary coding folders.
+    """
+    if not isinstance(project_root, str) or not project_root:
+        return {
+            "is_ableton_project": False,
+            "signals": [],
+            "reason": "project_root_missing"
+        }
+
+    root = os.path.abspath(project_root)
+    if not os.path.isdir(root):
+        return {
+            "is_ableton_project": False,
+            "signals": [],
+            "reason": "project_root_not_dir"
+        }
+
+    # Allow explicit override for unusual project layouts.
+    force_flag = os.environ.get("ABLETON_MCP_FORCE_PROJECT_BOOTSTRAP")
+    if isinstance(force_flag, str) and force_flag.strip().lower() in {"1", "true", "yes", "on"}:
+        return {
+            "is_ableton_project": True,
+            "signals": ["env_override:ABLETON_MCP_FORCE_PROJECT_BOOTSTRAP"],
+            "reason": "env_override"
+        }
+
+    signals = []
+    try:
+        entries = list(Path(root).iterdir())
+    except Exception:
+        return {
+            "is_ableton_project": False,
+            "signals": [],
+            "reason": "listdir_failed"
+        }
+
+    # Strong signal: a Live set file at project root.
+    if any(entry.is_file() and entry.suffix.lower() == ".als" for entry in entries):
+        signals.append("top_level_als")
+
+    # Common Ableton project directories/files. We treat these as supporting signals.
+    common_names = {
+        "Ableton Project Info",
+        "Project Info",
+        "Samples",
+        "Backup",
+        "Recordings",
+        "AbletonMCP",
+    }
+    present_names = {entry.name for entry in entries}
+    for name in sorted(common_names):
+        if name in present_names:
+            signals.append("entry:" + name)
+
+    # A valid "help me mix/master in this session" folder should usually have a Live set.
+    # We still accept strong project-folder patterns (project metadata + media folders) if no .als
+    # is present yet, but require at least 2 supporting signals to avoid polluting random code repos.
+    supporting_count = len([s for s in signals if s != "top_level_als"])
+    is_ableton_project = ("top_level_als" in signals) or (supporting_count >= 2)
+
+    return {
+        "is_ableton_project": bool(is_ableton_project),
+        "signals": signals,
+        "reason": "detected" if is_ableton_project else "insufficient_ableton_signals"
+    }
+
+
 def get_project_root() -> Optional[str]:
     """
     Resolve project root path.
@@ -197,6 +269,18 @@ def ensure_project_agents_md() -> Dict[str, Any]:
             "warnings": ["project_root_unavailable"]
         }
 
+    detection = _looks_like_ableton_project_root(project_root)
+    if not detection.get("is_ableton_project"):
+        return {
+            "ok": True,
+            "copied": False,
+            "skipped": True,
+            "reason": "not_ableton_project_folder",
+            "agents_path": os.path.join(project_root, "AGENTS.md"),
+            "warnings": resolved.get("warnings", []),
+            "ableton_project_detection": detection,
+        }
+
     project_agents = os.path.join(project_root, "AGENTS.md")
     if os.path.exists(project_agents):
         return {
@@ -205,7 +289,8 @@ def ensure_project_agents_md() -> Dict[str, Any]:
             "skipped": True,
             "reason": "already_exists",
             "agents_path": project_agents,
-            "warnings": resolved.get("warnings", [])
+            "warnings": resolved.get("warnings", []),
+            "ableton_project_detection": detection,
         }
 
     source_agents = os.path.join(get_repo_root(), "AGENTS.md")
@@ -216,7 +301,8 @@ def ensure_project_agents_md() -> Dict[str, Any]:
             "skipped": True,
             "reason": "source_agents_missing",
             "agents_path": project_agents,
-            "warnings": ["source_agents_missing"]
+            "warnings": ["source_agents_missing"],
+            "ableton_project_detection": detection,
         }
 
     try:
@@ -227,7 +313,8 @@ def ensure_project_agents_md() -> Dict[str, Any]:
             "skipped": False,
             "reason": "copied_from_repo",
             "agents_path": project_agents,
-            "warnings": resolved.get("warnings", [])
+            "warnings": resolved.get("warnings", []),
+            "ableton_project_detection": detection,
         }
     except Exception as exc:
         return {
@@ -236,7 +323,8 @@ def ensure_project_agents_md() -> Dict[str, Any]:
             "skipped": True,
             "reason": "copy_failed",
             "agents_path": project_agents,
-            "warnings": [f"copy_failed:{str(exc)}"]
+            "warnings": [f"copy_failed:{str(exc)}"],
+            "ableton_project_detection": detection,
         }
 
 

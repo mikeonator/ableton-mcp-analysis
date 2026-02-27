@@ -185,7 +185,7 @@ Once the config file has been set on Claude, and the remote script is running in
 - Source inventory + spectral/loudness summaries for arrangement clips (`index_sources_from_live_set`)
 - Mix/master context helpers for LLM guidance (`build_mix_context_profile`, `build_mix_master_context`)
 - Semantic role inference and tag persistence (`infer_mix_context_tags`, `get_mix_context_tags`, `save_mix_context_tags`)
-- Automation-state overview (read-first; envelope points not yet exposed) (`get_automation_overview`, `get_track_automation_targets`)
+- Automation visibility from overview to exact points (`get_automation_overview`, `get_track_automation_targets`, `get_automation_envelope_points`, `get_clip_automation_envelope_points`, `enumerate_project_automation`, `enumerate_project_automation_exhaustive`, `get_automation_target_points`)
 
 ## Mix/Master Readiness (Read-First)
 
@@ -197,8 +197,19 @@ This repo now includes read-first tools aimed at mixing/mastering assistance (wi
 - `build_mix_context_profile`: merges explicit tags with deterministic name-based inference
 - `analyze_mastering_file`: loudness, true peak, stereo correlation/width, mono fold-down deltas, clipping count
 - `build_mix_master_context`: LLM-ready payload with stage readiness for mix prep, submix, exports, and mastering
+- `enumerate_project_automation_exhaustive`: canonical ALS-first saved-state automation inventory (paged, completeness diagnostics)
+- `get_automation_target_points`: drill-down exact point payload for one exhaustive inventory target
 
 `build_mix_master_context` is designed to tell an LLM what is present, what is missing, and which MCP tools to call next.
+
+### Session Clip Envelope Coverage
+
+Session View clip envelopes are now supported in the exhaustive ALS inventory path:
+- `enumerate_project_automation_exhaustive(..., include_session_clip_envelopes=true)` emits `container_scope="clip_session"` rows
+- `get_automation_target_points(...)` resolves exact points for session clip targets from canonical `target_ref`
+- Scope metadata is explicit in `scope_statement`:
+  - `session_clip_envelopes_included=true` when enabled
+  - `session_clip_envelopes_excluded=true` only when explicitly disabled
 
 ## Example Commands
 
