@@ -228,6 +228,8 @@ class AbletonMCP(ControlSurface):
             # Route the command to the appropriate handler
             if command_type == "get_session_info":
                 response["result"] = self._get_session_info()
+            elif command_type == "get_time_locators":
+                response["result"] = self._get_time_locators()
             elif command_type == "get_track_info":
                 track_index = params.get("track_index", 0)
                 response["result"] = self._get_track_info(track_index)
@@ -242,13 +244,22 @@ class AbletonMCP(ControlSurface):
                 response["result"] = self._get_detail_clip_source_path()
             elif command_type == "get_track_devices":
                 track_index = params.get("track_index", 0)
-                response["result"] = self._get_track_devices(track_index)
+                include_nested = params.get("include_nested", False)
+                max_depth = params.get("max_depth", 4)
+                response["result"] = self._get_track_devices(
+                    track_index=track_index,
+                    include_nested=include_nested,
+                    max_depth=max_depth
+                )
             elif command_type == "get_device_parameters":
                 track_index = params.get("track_index", 0)
                 device_index = params.get("device_index", 0)
                 offset = params.get("offset", 0)
                 limit = params.get("limit", 64)
-                response["result"] = self._get_device_parameters(track_index, device_index, offset, limit)
+                device_path = params.get("device_path", None)
+                response["result"] = self._get_device_parameters(
+                    track_index, device_index, offset, limit, device_path=device_path
+                )
             elif command_type == "get_transport_state":
                 response["result"] = self._get_transport_state()
             elif command_type == "get_tracks_mixer_state":
@@ -422,6 +433,15 @@ class AbletonMCP(ControlSurface):
     def _get_session_info(self):
         """Get information about the current session"""
         try:
+            locator_payload = self._get_time_locators()
+            locator_rows = []
+            if (
+                isinstance(locator_payload, dict)
+                and bool(locator_payload.get("ok"))
+                and bool(locator_payload.get("supported"))
+                and isinstance(locator_payload.get("locators"), list)
+            ):
+                locator_rows = locator_payload.get("locators")
             result = {
                 "tempo": self._song.tempo,
                 "signature_numerator": self._song.signature_numerator,
@@ -430,6 +450,9 @@ class AbletonMCP(ControlSurface):
                 "return_track_count": len(self._song.return_tracks),
                 "is_playing": bool(self._song.is_playing),
                 "current_song_time": float(self._song.current_song_time),
+                "has_time_locators": bool(len(locator_rows) > 0),
+                "time_locator_count": int(len(locator_rows)),
+                "time_locators_preview": list(locator_rows[:5]),
                 "master_track": {
                     "name": "Master",
                     "volume": self._song.master_track.mixer_device.volume.value,
@@ -440,6 +463,71 @@ class AbletonMCP(ControlSurface):
         except Exception as e:
             self.log_message("Error getting session info: " + str(e))
             raise
+
+    def _get_time_locators(self):
+        """Return song cue points as deterministic time locator rows."""
+        song = self._get_song()
+        if song is None:
+            return {
+                "ok": False,
+                "supported": False,
+                "error": "song_unavailable",
+                "message": "Could not access song",
+                "locators": [],
+                "locator_count": 0
+            }
+
+        cue_points_raw = self._safe_attr(song, "cue_points")
+        cue_points = self._to_list(cue_points_raw)
+        if cue_points is None:
+            current_song_time = float(self._safe_attr(song, "current_song_time") or 0.0)
+            return {
+                "ok": True,
+                "supported": False,
+                "reason": "cue_points_unavailable",
+                "locators": [],
+                "locator_count": 0,
+                "current_song_time_beats": current_song_time,
+                "current_song_time_sec": current_song_time
+            }
+        if not isinstance(cue_points, list):
+            cue_points = []
+
+        locators = []
+        for index, cue in enumerate(cue_points):
+            cue_time = self._json_scalar(self._safe_attr(cue, "time"))
+            if not isinstance(cue_time, (int, float)):
+                continue
+            cue_name = self._safe_text(self._safe_attr(cue, "name")) or ("Locator {0}".format(index + 1))
+            locators.append({
+                "index": int(index),
+                "name": cue_name,
+                "time_beats": float(cue_time)
+            })
+
+        locators.sort(key=lambda row: (float(row.get("time_beats", 0.0)), int(row.get("index", 0))))
+        current_song_time = float(self._safe_attr(song, "current_song_time") or 0.0)
+
+        previous_locator = None
+        next_locator = None
+        for row in locators:
+            row_time = float(row.get("time_beats", 0.0))
+            if row_time <= current_song_time:
+                previous_locator = row
+            if row_time > current_song_time:
+                next_locator = row
+                break
+
+        return {
+            "ok": True,
+            "supported": True,
+            "locators": locators,
+            "locator_count": len(locators),
+            "current_song_time_beats": current_song_time,
+            "current_song_time_sec": current_song_time,
+            "previous_locator": previous_locator,
+            "next_locator": next_locator
+        }
     
     def _get_track_info(self, track_index):
         """Get information about a track"""
@@ -1162,7 +1250,16 @@ class AbletonMCP(ControlSurface):
 
         return class_name, is_plugin, plugin_format, vendor
 
-    def _serialize_device_chain_entry(self, device_index, device):
+    def _serialize_device_chain_entry(
+        self,
+        device_index,
+        device,
+        device_path=None,
+        depth=None,
+        chain_index=None,
+        chain_name=None,
+        parent_device_path=None
+    ):
         """Serialize one device in a track chain."""
         name = self._safe_attr(device, "name")
         if name is not None and not isinstance(name, string_types):
@@ -1175,7 +1272,7 @@ class AbletonMCP(ControlSurface):
         parameters = self._to_list(self._safe_attr(device, "parameters"))
         parameter_count = len(parameters) if isinstance(parameters, list) else None
 
-        return {
+        row = {
             "device_index": device_index,
             "name": name,
             "class_name": class_name,
@@ -1184,6 +1281,199 @@ class AbletonMCP(ControlSurface):
             "vendor": vendor,
             "parameter_count": parameter_count
         }
+        if isinstance(device_path, list):
+            safe_path = []
+            for value in device_path:
+                try:
+                    safe_path.append(int(value))
+                except Exception:
+                    continue
+            row["device_path"] = safe_path
+        if isinstance(depth, int):
+            row["depth"] = int(depth)
+        if isinstance(chain_index, int):
+            row["chain_index"] = int(chain_index)
+        if chain_name is not None:
+            row["chain_name"] = chain_name
+        if isinstance(parent_device_path, list):
+            safe_parent = []
+            for value in parent_device_path:
+                try:
+                    safe_parent.append(int(value))
+                except Exception:
+                    continue
+            row["parent_device_path"] = safe_parent
+        return row
+
+    def _iter_device_chains(self, device):
+        """Return best-effort chain payloads for rack-like devices."""
+        can_have_chains = self._safe_attr(device, "can_have_chains")
+        if not bool(can_have_chains):
+            return []
+
+        chains_raw = self._safe_attr(device, "chains")
+        chains = self._to_list(chains_raw)
+        if not isinstance(chains, list):
+            return []
+
+        rows = []
+        for chain_index, chain in enumerate(chains):
+            chain_devices_raw = self._safe_attr(chain, "devices")
+            chain_devices = self._to_list(chain_devices_raw)
+            if not isinstance(chain_devices, list):
+                chain_devices = []
+            rows.append({
+                "chain_index": int(chain_index),
+                "chain_name": self._safe_text(self._safe_attr(chain, "name")),
+                "devices": chain_devices
+            })
+        return rows
+
+    def _collect_nested_devices(self, parent_device, parent_device_path, depth, max_depth, out_rows):
+        """Recursively collect nested rack-chain devices."""
+        if depth > max_depth:
+            return
+
+        chain_rows = self._iter_device_chains(parent_device)
+        for chain_row in chain_rows:
+            chain_index = chain_row.get("chain_index")
+            chain_name = chain_row.get("chain_name")
+            chain_devices = chain_row.get("devices")
+            if not isinstance(chain_devices, list):
+                continue
+
+            for chain_device_index, child_device in enumerate(chain_devices):
+                child_path = list(parent_device_path) + [int(chain_index), int(chain_device_index)]
+                child_row = self._serialize_device_chain_entry(
+                    device_index=int(chain_device_index),
+                    device=child_device,
+                    device_path=child_path,
+                    depth=int(depth),
+                    chain_index=int(chain_index),
+                    chain_name=chain_name,
+                    parent_device_path=list(parent_device_path)
+                )
+                child_row["is_nested"] = True
+                out_rows.append(child_row)
+
+                if depth < max_depth:
+                    self._collect_nested_devices(
+                        parent_device=child_device,
+                        parent_device_path=child_path,
+                        depth=depth + 1,
+                        max_depth=max_depth,
+                        out_rows=out_rows
+                    )
+
+    def _resolve_device_by_path(self, track, device_index, device_path=None):
+        """Resolve a top-level or nested device path for parameter reads."""
+        devices_raw = self._safe_attr(track, "devices")
+        devices = self._to_list(devices_raw)
+        if not isinstance(devices, list):
+            devices = []
+
+        if device_index < 0 or device_index >= len(devices):
+            return None, None, {
+                "ok": False,
+                "error": "invalid_device_index",
+                "message": "device_index out of range",
+                "device_index": device_index,
+                "device_count": len(devices)
+            }, len(devices)
+
+        if device_path is None:
+            return devices[device_index], [int(device_index)], None, len(devices)
+
+        if not isinstance(device_path, list):
+            return None, None, {
+                "ok": False,
+                "error": "invalid_device_path",
+                "message": "device_path must be a list of integers",
+                "device_index": device_index
+            }, len(devices)
+
+        normalized_path = []
+        for value in device_path:
+            parsed = self._safe_int_param(value)
+            if parsed is None:
+                return None, None, {
+                    "ok": False,
+                    "error": "invalid_device_path",
+                    "message": "device_path entries must be integers",
+                    "device_index": device_index,
+                    "device_path": device_path
+                }, len(devices)
+            normalized_path.append(int(parsed))
+
+        if not normalized_path:
+            return None, None, {
+                "ok": False,
+                "error": "invalid_device_path",
+                "message": "device_path cannot be empty when provided",
+                "device_index": device_index
+            }, len(devices)
+
+        if normalized_path[0] != int(device_index):
+            return None, None, {
+                "ok": False,
+                "error": "device_path_mismatch",
+                "message": "device_path[0] must match device_index",
+                "device_index": int(device_index),
+                "device_path": normalized_path
+            }, len(devices)
+
+        if len(normalized_path) % 2 == 0:
+            return None, None, {
+                "ok": False,
+                "error": "invalid_device_path",
+                "message": "device_path must have odd length [top_device, chain, device, ...]",
+                "device_index": int(device_index),
+                "device_path": normalized_path
+            }, len(devices)
+
+        current_device = devices[normalized_path[0]]
+        cursor = 1
+        while cursor < len(normalized_path):
+            chain_index = normalized_path[cursor]
+            chain_device_index = normalized_path[cursor + 1]
+
+            chain_rows = self._iter_device_chains(current_device)
+            selected_chain = None
+            for row in chain_rows:
+                if row.get("chain_index") == chain_index:
+                    selected_chain = row
+                    break
+
+            if not isinstance(selected_chain, dict):
+                return None, None, {
+                    "ok": False,
+                    "error": "invalid_chain_index",
+                    "message": "device_path chain index out of range",
+                    "device_index": int(device_index),
+                    "device_path": normalized_path,
+                    "chain_index": int(chain_index),
+                    "chain_count": len(chain_rows)
+                }, len(devices)
+
+            chain_devices = selected_chain.get("devices")
+            if not isinstance(chain_devices, list):
+                chain_devices = []
+            if chain_device_index < 0 or chain_device_index >= len(chain_devices):
+                return None, None, {
+                    "ok": False,
+                    "error": "invalid_nested_device_index",
+                    "message": "device_path nested device index out of range",
+                    "device_index": int(device_index),
+                    "device_path": normalized_path,
+                    "chain_index": int(chain_index),
+                    "nested_device_index": int(chain_device_index),
+                    "chain_device_count": len(chain_devices)
+                }, len(devices)
+
+            current_device = chain_devices[chain_device_index]
+            cursor += 2
+
+        return current_device, normalized_path, None, len(devices)
 
     def _serialize_device_parameter(self, parameter_index, parameter):
         """Serialize one device parameter."""
@@ -2465,12 +2755,19 @@ class AbletonMCP(ControlSurface):
 
         return result
 
-    def _get_track_devices(self, track_index):
+    def _get_track_devices(self, track_index, include_nested=False, max_depth=4):
         """Return the ordered device chain for a track."""
         try:
             song, track, error_payload = self._resolve_track_by_index(track_index)
             if error_payload is not None:
                 return error_payload
+
+            include_nested = bool(include_nested)
+            max_depth_value = self._safe_int_param(max_depth)
+            if max_depth_value is None:
+                max_depth_value = 4
+            if max_depth_value < 0:
+                max_depth_value = 0
 
             devices_raw = self._safe_attr(track, "devices")
             devices = self._to_list(devices_raw)
@@ -2479,7 +2776,24 @@ class AbletonMCP(ControlSurface):
 
             device_entries = []
             for device_index, device in enumerate(devices):
-                device_entries.append(self._serialize_device_chain_entry(device_index, device))
+                top_path = [int(device_index)]
+                top_row = self._serialize_device_chain_entry(
+                    device_index=device_index,
+                    device=device,
+                    device_path=top_path,
+                    depth=0
+                )
+                top_row["is_nested"] = False
+                device_entries.append(top_row)
+
+                if include_nested and max_depth_value > 0:
+                    self._collect_nested_devices(
+                        parent_device=device,
+                        parent_device_path=top_path,
+                        depth=1,
+                        max_depth=max_depth_value,
+                        out_rows=device_entries
+                    )
 
             track_name = self._safe_attr(track, "name")
             if track_name is not None and not isinstance(track_name, string_types):
@@ -2492,6 +2806,9 @@ class AbletonMCP(ControlSurface):
                 "ok": True,
                 "track_index": int(track_index),
                 "track_name": track_name,
+                "include_nested": include_nested,
+                "max_depth": int(max_depth_value),
+                "top_level_device_count": len(devices),
                 "device_count": len(device_entries),
                 "devices": device_entries
             }
@@ -2503,7 +2820,7 @@ class AbletonMCP(ControlSurface):
                 "track_index": track_index
             }
 
-    def _get_device_parameters(self, track_index, device_index, offset, limit):
+    def _get_device_parameters(self, track_index, device_index, offset, limit, device_path=None):
         """Return paged parameters for a device on a track."""
         try:
             song, track, error_payload = self._resolve_track_by_index(track_index)
@@ -2563,22 +2880,15 @@ class AbletonMCP(ControlSurface):
                     "limit": limit
                 }
 
-            devices_raw = self._safe_attr(track, "devices")
-            devices = self._to_list(devices_raw)
-            if not isinstance(devices, list):
-                devices = []
+            device, resolved_device_path, path_error, top_level_count = self._resolve_device_by_path(
+                track=track,
+                device_index=device_index,
+                device_path=device_path
+            )
+            if path_error is not None:
+                path_error["track_index"] = track_index
+                return path_error
 
-            if device_index < 0 or device_index >= len(devices):
-                return {
-                    "ok": False,
-                    "error": "invalid_device_index",
-                    "message": "device_index out of range",
-                    "track_index": track_index,
-                    "device_index": device_index,
-                    "device_count": len(devices)
-                }
-
-            device = devices[device_index]
             device_name = self._safe_attr(device, "name")
             if device_name is not None and not isinstance(device_name, string_types):
                 try:
@@ -2606,6 +2916,8 @@ class AbletonMCP(ControlSurface):
                 "track_index": int(track_index),
                 "device_index": int(device_index),
                 "device_name": device_name,
+                "device_path": resolved_device_path,
+                "top_level_device_count": int(top_level_count),
                 "offset": int(offset),
                 "limit": int(limit),
                 "total_parameters": total_parameters,
@@ -3280,27 +3592,73 @@ class AbletonMCP(ControlSurface):
             path_parts = path.split("/")
             if not path_parts:
                 raise ValueError("Invalid path")
-            
-            # Determine the root category
-            root_category = path_parts[0].lower()
+
+            # Determine the root category with tolerant token normalization.
+            def _normalize_root_token(value):
+                token = (value or "").strip().lower()
+                if not token:
+                    return ""
+                chars = []
+                prev_sep = False
+                for ch in token:
+                    if ch.isalnum():
+                        chars.append(ch)
+                        prev_sep = False
+                    else:
+                        if not prev_sep:
+                            chars.append("_")
+                            prev_sep = True
+                return "".join(chars).strip("_")
+
+            root_category = _normalize_root_token(path_parts[0])
+            root_aliases = {
+                "instrument": "instruments",
+                "instruments": "instruments",
+                "sound": "sounds",
+                "sounds": "sounds",
+                "drum": "drums",
+                "drums": "drums",
+                "audio_effect": "audio_effects",
+                "audio_effects": "audio_effects",
+                "audiofx": "audio_effects",
+                "midi_effect": "midi_effects",
+                "midi_effects": "midi_effects",
+                "midifx": "midi_effects",
+                "clip": "clips",
+                "clips": "clips",
+                "current_project": "current_project",
+                "currentproject": "current_project",
+                "max_for_live": "max_for_live",
+                "maxforlive": "max_for_live",
+                "packs": "packs",
+                "plugins": "plugins",
+                "plugin": "plugins",
+                "samples": "samples",
+                "sample": "samples",
+                "user_library": "user_library",
+                "userlibrary": "user_library",
+                "user_folders": "user_folders",
+                "userfolders": "user_folders"
+            }
+            canonical_root = root_aliases.get(root_category, root_category)
             current_item = None
             
             # Check standard categories first
-            if root_category == "instruments" and hasattr(app.browser, 'instruments'):
+            if canonical_root == "instruments" and hasattr(app.browser, 'instruments'):
                 current_item = app.browser.instruments
-            elif root_category == "sounds" and hasattr(app.browser, 'sounds'):
+            elif canonical_root == "sounds" and hasattr(app.browser, 'sounds'):
                 current_item = app.browser.sounds
-            elif root_category == "drums" and hasattr(app.browser, 'drums'):
+            elif canonical_root == "drums" and hasattr(app.browser, 'drums'):
                 current_item = app.browser.drums
-            elif root_category == "audio_effects" and hasattr(app.browser, 'audio_effects'):
+            elif canonical_root == "audio_effects" and hasattr(app.browser, 'audio_effects'):
                 current_item = app.browser.audio_effects
-            elif root_category == "midi_effects" and hasattr(app.browser, 'midi_effects'):
+            elif canonical_root == "midi_effects" and hasattr(app.browser, 'midi_effects'):
                 current_item = app.browser.midi_effects
             else:
                 # Try to find the category in other browser attributes
                 found = False
                 for attr in browser_attrs:
-                    if attr.lower() == root_category:
+                    if _normalize_root_token(attr) == canonical_root:
                         try:
                             current_item = getattr(app.browser, attr)
                             found = True
@@ -3312,7 +3670,7 @@ class AbletonMCP(ControlSurface):
                     # If we still haven't found the category, return available categories
                     return {
                         "path": path,
-                        "error": "Unknown or unavailable category: {0}".format(root_category),
+                        "error": "Unknown or unavailable category: {0}".format(path_parts[0]),
                         "available_categories": browser_attrs,
                         "items": []
                     }

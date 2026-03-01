@@ -8,6 +8,7 @@ from MCP_Server.als_automation import (
     enumerate_non_track_arrangement_automation_from_project_als,
     build_als_automation_inventory,
     get_als_automation_target_points_from_inventory,
+    read_time_locators_from_project_als,
 )
 
 
@@ -231,6 +232,30 @@ _SYNTH_ALS_XML = """<?xml version="1.0" encoding="utf-8"?>
 """
 
 
+_LOCATOR_ALS_XML = """<?xml version="1.0" encoding="utf-8"?>
+<Ableton>
+  <LiveSet>
+    <Locators>
+      <Locators>
+        <Locator Id="2">
+          <Time Value="32" />
+          <Name>
+            <EffectiveName Value="Verse" />
+          </Name>
+        </Locator>
+        <Locator Id="1">
+          <Time Value="8" />
+          <Name>
+            <EffectiveName Value="Intro" />
+          </Name>
+        </Locator>
+      </Locators>
+    </Locators>
+  </LiveSet>
+</Ableton>
+"""
+
+
 class AlsAutomationParserTests(unittest.TestCase):
     def _write_als(self, project_root: str, file_name: str = "Test Set.als") -> str:
         os.makedirs(project_root, exist_ok=True)
@@ -416,6 +441,24 @@ class AlsAutomationParserTests(unittest.TestCase):
             if isinstance(row, dict) and row.get("container_scope") == "clip_session"
         ]
         self.assertEqual(session_rows, [])
+
+    def test_reads_time_locators_from_als_and_sorts_by_time(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            als_path = os.path.join(tmpdir, "Locators.als")
+            with gzip.open(als_path, "wb") as handle:
+                handle.write(_LOCATOR_ALS_XML.encode("utf-8"))
+
+            result = read_time_locators_from_project_als(
+                project_root=tmpdir,
+                als_file_path=als_path,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["supported"])
+        self.assertEqual(result["locator_count"], 2)
+        self.assertEqual([row["name"] for row in result["locators"]], ["Intro", "Verse"])
+        self.assertEqual([row["time_beats"] for row in result["locators"]], [8.0, 32.0])
+        self.assertIn("saved_als_snapshot_only", result["warnings"])
 
 
 if __name__ == "__main__":

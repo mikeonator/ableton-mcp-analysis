@@ -127,6 +127,194 @@ def _read_xml_from_als_file(als_path: str) -> Tuple[Optional[ET.Element], Option
         return None, "xml_parse_failed:{0}".format(str(exc))
 
 
+def _xml_attr_or_text(node: Optional[ET.Element], attr_name: str = "Value") -> Optional[str]:
+    """Return preferred XML attribute or text from a node."""
+    if node is None:
+        return None
+    attr_value = _safe_text(node.attrib.get(attr_name))
+    if attr_value:
+        return attr_value
+    return _safe_text(node.text)
+
+
+def _locator_time_from_node(locator_node: ET.Element) -> Optional[float]:
+    """Best-effort locator beat-time extraction from varying ALS shapes."""
+    candidates: List[Any] = [
+        locator_node.attrib.get("Time"),
+        locator_node.attrib.get("time"),
+        locator_node.attrib.get("Value"),
+    ]
+
+    for path in (
+        "./Time",
+        "./CurrentTime",
+        "./SongTime",
+        "./BeatTime",
+        "./TimeInBeats",
+        "./StartTime",
+    ):
+        node = locator_node.find(path)
+        if node is None:
+            continue
+        candidates.append(node.attrib.get("Value"))
+        candidates.append(node.attrib.get("Time"))
+        candidates.append(node.text)
+
+    for value in candidates:
+        parsed = _safe_float(value)
+        if parsed is not None:
+            return float(parsed)
+    return None
+
+
+def _locator_name_from_node(locator_node: ET.Element, fallback_name: str) -> str:
+    """Best-effort locator name extraction from varying ALS locator shapes."""
+    for path in (
+        "./Name/EffectiveName",
+        "./Name/UserName",
+        "./Name",
+        "./Text",
+        "./Label",
+        "./LocatorName",
+    ):
+        text = _xml_attr_or_text(locator_node.find(path))
+        if text:
+            return text
+
+    for key in ("Name", "name", "Label", "label", "Text", "text", "Title", "title"):
+        text = _safe_text(locator_node.attrib.get(key))
+        if text:
+            return text
+
+    return fallback_name
+
+
+def read_time_locators_from_project_als(
+    project_root: Optional[str],
+    als_file_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Read time locators/cue points from the saved .als file (best effort).
+
+    Returns locators sorted by time with deterministic index assignment.
+    """
+    als_info = _resolve_als_file(project_root, als_file_path=als_file_path)
+    if als_info.get("supported") is not True:
+        return {
+            "ok": True,
+            "supported": False,
+            "source": "als_file",
+            "reason": als_info.get("reason") or "als_unavailable",
+            "locators": [],
+            "locator_count": 0,
+            "warnings": list(als_info.get("warnings") or []),
+            "als_file_path": als_info.get("als_file_path"),
+        }
+
+    als_path = _safe_text(als_info.get("als_file_path"))
+    root, read_error = _read_xml_from_als_file(als_path)
+    if root is None:
+        warnings = list(als_info.get("warnings") or [])
+        if read_error:
+            warnings.append(read_error)
+        return {
+            "ok": True,
+            "supported": False,
+            "source": "als_file",
+            "reason": "als_parse_failed",
+            "locators": [],
+            "locator_count": 0,
+            "warnings": warnings,
+            "als_file_path": als_path,
+            "als_file_mtime_utc": als_info.get("als_file_mtime_utc"),
+        }
+
+    live_set = root.find("./LiveSet")
+    if live_set is None:
+        return {
+            "ok": True,
+            "supported": False,
+            "source": "als_file",
+            "reason": "live_set_node_missing",
+            "locators": [],
+            "locator_count": 0,
+            "warnings": list(als_info.get("warnings") or []) + ["live_set_node_missing"],
+            "als_file_path": als_path,
+            "als_file_mtime_utc": als_info.get("als_file_mtime_utc"),
+        }
+
+    locator_nodes: List[ET.Element] = []
+    seen_nodes = set()
+
+    explicit_parent_paths = (
+        "./Locators/Locators",
+        "./Locators",
+        "./CuePoints/CuePoints",
+        "./CuePoints",
+        "./Arrangement/Locators",
+    )
+    for parent_path in explicit_parent_paths:
+        parent = live_set.find(parent_path)
+        if parent is None:
+            continue
+        for child in list(parent):
+            if not isinstance(child.tag, str):
+                continue
+            node_id = id(child)
+            if node_id in seen_nodes:
+                continue
+            seen_nodes.add(node_id)
+            locator_nodes.append(child)
+
+    if not locator_nodes:
+        for node in live_set.iter():
+            if not isinstance(node.tag, str):
+                continue
+            tag_lower = node.tag.lower()
+            if "locator" not in tag_lower and "cuepoint" not in tag_lower and "cue_point" not in tag_lower:
+                continue
+            if _locator_time_from_node(node) is None:
+                continue
+            node_id = id(node)
+            if node_id in seen_nodes:
+                continue
+            seen_nodes.add(node_id)
+            locator_nodes.append(node)
+
+    locators: List[Dict[str, Any]] = []
+    for raw_index, locator_node in enumerate(locator_nodes):
+        time_beats = _locator_time_from_node(locator_node)
+        if time_beats is None:
+            continue
+        fallback_name = "Locator {0}".format(raw_index + 1)
+        locator_name = _locator_name_from_node(locator_node, fallback_name=fallback_name)
+        locators.append({
+            "index": int(raw_index),
+            "name": locator_name,
+            "time_beats": float(time_beats),
+        })
+
+    locators.sort(key=lambda row: (float(row.get("time_beats", 0.0)), int(row.get("index", 0))))
+    for idx, row in enumerate(locators):
+        row["index"] = int(idx)
+
+    warnings = list(als_info.get("warnings") or [])
+    if "saved_als_snapshot_only" not in warnings:
+        warnings.append("saved_als_snapshot_only")
+
+    return {
+        "ok": True,
+        "supported": True,
+        "source": "als_file",
+        "locators": locators,
+        "locator_count": len(locators),
+        "warnings": warnings,
+        "als_file_path": als_path,
+        "als_file_mtime_utc": als_info.get("als_file_mtime_utc"),
+        "als_candidate_count": als_info.get("candidate_count"),
+    }
+
+
 def _resolve_als_file(project_root: Optional[str], als_file_path: Optional[str] = None) -> Dict[str, Any]:
     override_path = _safe_text(als_file_path)
     if override_path:
