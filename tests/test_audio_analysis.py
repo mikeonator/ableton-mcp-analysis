@@ -202,6 +202,13 @@ class AnalyzeWavFileTests(unittest.TestCase):
         self.assertGreaterEqual(len(result["stereo_correlation_series"]), 1)
         self.assertIsInstance(result["clipped_sample_count"], int)
         self.assertGreater(result["clipped_sample_count"], 0)
+        self.assertIsInstance(result.get("peak_sample_frame"), int)
+        self.assertIsInstance(result.get("peak_sample_time_sec"), float)
+        self.assertIsInstance(result.get("peak_sample_channel"), int)
+        self.assertIsInstance(result.get("top_peak_events"), list)
+        self.assertTrue(result["top_peak_events"])
+        self.assertIn("analysis_pipeline", result)
+        self.assertIn("decode", result["analysis_pipeline"])
 
         corr_values = [
             row["correlation"]
@@ -237,6 +244,47 @@ class AnalyzeWavFileTests(unittest.TestCase):
         self.assertEqual(result["stereo_correlation_series"], [])
         self.assertIsNone(result["stereo_width_score"])
         self.assertIsInstance(result.get("analysis_notes"), list)
+
+    def test_ffmpeg_path_resolution_honors_env_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_ffmpeg = Path(tmpdir) / "ffmpeg"
+            fake_ffmpeg.write_text("#!/bin/sh\\nexit 0\\n", encoding="utf-8")
+            fake_ffmpeg.chmod(0o755)
+
+            with mock.patch.dict(
+                os.environ,
+                {"ABLETON_MCP_FFMPEG_PATH": str(fake_ffmpeg)},
+                clear=False,
+            ):
+                with mock.patch.object(server.shutil, "which", return_value=None):
+                    probe = server._resolve_ffmpeg_path()
+
+        self.assertTrue(probe["available"])
+        self.assertEqual(probe["path"], str(fake_ffmpeg))
+        self.assertEqual(probe["source"], "env_override")
+
+    def test_analyze_mastering_file_reports_pipeline_when_soundfile_missing(self) -> None:
+        sr = 44100
+        t = np.arange(sr, dtype=np.float32) / float(sr)
+        stereo = np.stack(
+            [
+                0.2 * np.sin(2.0 * math.pi * 440.0 * t),
+                0.2 * np.sin(2.0 * math.pi * 660.0 * t),
+            ],
+            axis=1,
+        ).astype(np.float32)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wav_path = Path(tmpdir) / "fallback_decode.wav"
+            _write_wav_stereo_16bit(wav_path, stereo, sr)
+
+            with mock.patch.object(server, "sf", None):
+                with mock.patch.object(server, "AudioSegment", None):
+                    result = server.analyze_mastering_file(None, str(wav_path), window_sec=0.5)
+
+        self.assertTrue(result["ok"])
+        pipeline = result.get("analysis_pipeline", {})
+        self.assertEqual(pipeline.get("decode", {}).get("backend"), "stdlib_wav")
 
 
 if __name__ == "__main__":

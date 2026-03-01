@@ -10,6 +10,8 @@ import re
 import shutil
 import subprocess
 import copy
+import sys
+import wave
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
@@ -20,6 +22,7 @@ from MCP_Server.als_automation import (
     enumerate_non_track_arrangement_automation_from_project_als,
     build_als_automation_inventory,
     get_als_automation_target_points_from_inventory,
+    read_time_locators_from_project_als,
 )
 from MCP_Server.pathing import (
     get_export_dir,
@@ -297,6 +300,55 @@ _KNOWN_BROWSER_ROOTS = [
     "User Library",
     "User Folders"
 ]
+_BROWSER_ROOT_ALIAS_MAP = {
+    "audio_effect": "Audio Effects",
+    "audio_effects": "Audio Effects",
+    "audiofx": "Audio Effects",
+    "audio_fx": "Audio Effects",
+    "plugin": "Plugins",
+    "plugins": "Plugins",
+    "midi_effect": "MIDI Effects",
+    "midi_effects": "MIDI Effects",
+    "midifx": "MIDI Effects",
+    "midi_fx": "MIDI Effects",
+    "instrument": "Instruments",
+    "instruments": "Instruments",
+    "sound": "Sounds",
+    "sounds": "Sounds",
+    "drum": "Drums",
+    "drums": "Drums",
+    "clip": "Clips",
+    "clips": "Clips",
+    "current_project": "Current Project",
+    "currentproject": "Current Project",
+    "max_for_live": "Max for Live",
+    "maxforlive": "Max for Live",
+    "m4l": "Max for Live",
+    "pack": "Packs",
+    "packs": "Packs",
+    "sample": "Samples",
+    "samples": "Samples",
+    "user_library": "User Library",
+    "userlibrary": "User Library",
+    "user_folders": "User Folders",
+    "userfolders": "User Folders",
+}
+_BROWSER_ROOT_TO_TOKEN = {
+    "Audio Effects": "audio_effects",
+    "Plugins": "plugins",
+    "MIDI Effects": "midi_effects",
+    "Instruments": "instruments",
+    "Max for Live": "max_for_live",
+    "Sounds": "sounds",
+    "Drums": "drums",
+    "Clips": "clips",
+    "Current Project": "current_project",
+    "Packs": "packs",
+    "Samples": "samples",
+    "User Library": "user_library",
+    "User Folders": "user_folders",
+}
+_DEVICE_INVENTORY_RUNTIME_CACHE: Dict[str, Dict[str, Any]] = {}
 
 def get_ableton_connection():
     """Get or create a persistent Ableton connection"""
@@ -519,6 +571,68 @@ def _decoded_wav_cache_path(
     return os.path.join(_ensure_decoded_audio_tmp_dir(), f"{cache_key}.wav")
 
 
+def _resolve_ffmpeg_path() -> Dict[str, Any]:
+    """Resolve ffmpeg path using env override first, then PATH lookup."""
+    override_raw = os.environ.get("ABLETON_MCP_FFMPEG_PATH")
+    override = override_raw.strip() if isinstance(override_raw, str) else None
+    attempted_paths: List[str] = []
+
+    if override:
+        override_path = os.path.abspath(os.path.expanduser(override))
+        attempted_paths.append(override_path)
+        if os.path.isfile(override_path) and os.access(override_path, os.X_OK):
+            return {
+                "available": True,
+                "path": override_path,
+                "source": "env_override",
+                "attempted_paths": attempted_paths,
+            }
+        return {
+            "available": False,
+            "path": None,
+            "source": "env_override",
+            "attempted_paths": attempted_paths,
+            "message": "ABLETON_MCP_FFMPEG_PATH is set but not executable"
+        }
+
+    discovered = shutil.which("ffmpeg")
+    if discovered:
+        discovered_path = os.path.abspath(discovered)
+        attempted_paths.append(discovered_path)
+        return {
+            "available": True,
+            "path": discovered_path,
+            "source": "path_lookup",
+            "attempted_paths": attempted_paths,
+        }
+
+    attempted_paths.append("ffmpeg")
+    return {
+        "available": False,
+        "path": None,
+        "source": "path_lookup",
+        "attempted_paths": attempted_paths,
+        "message": "ffmpeg not found in PATH"
+    }
+
+
+def _audio_dependency_diagnostics() -> Dict[str, Any]:
+    """Return deterministic decode dependency diagnostics for current runtime."""
+    ffmpeg_probe = _resolve_ffmpeg_path()
+    return {
+        "python_executable": _safe_text_value(getattr(sys, "executable", None)),
+        "numpy_available": np is not None,
+        "soundfile_available": sf is not None,
+        "pydub_available": AudioSegment is not None,
+        "scipy_available": sp_signal is not None,
+        "pyloudnorm_available": pyln is not None,
+        "ffmpeg_available": bool(ffmpeg_probe.get("available")),
+        "ffmpeg_path": ffmpeg_probe.get("path"),
+        "ffmpeg_resolution_source": ffmpeg_probe.get("source"),
+        "ffmpeg_attempted_paths": ffmpeg_probe.get("attempted_paths", []),
+    }
+
+
 def _decode_source_to_wav(
     source_path: str,
     input_format: str,
@@ -529,11 +643,17 @@ def _decode_source_to_wav(
     if input_format == "wav":
         return source_path, None
 
-    ffmpeg_path = shutil.which("ffmpeg")
-    if ffmpeg_path is None:
+    ffmpeg_probe = _resolve_ffmpeg_path()
+    ffmpeg_path = ffmpeg_probe.get("path")
+    if not ffmpeg_probe.get("available") or not isinstance(ffmpeg_path, str):
+        attempted_paths = ffmpeg_probe.get("attempted_paths", [])
+        attempted_text = ", ".join([str(path) for path in attempted_paths]) if isinstance(attempted_paths, list) else "unknown"
+        probe_message = ffmpeg_probe.get("message") or "ffmpeg executable unavailable"
         raise LiveCaptureError(
             "FFMPEG_NOT_FOUND",
-            "ffmpeg required to analyze mp3/aif/flac."
+            "ffmpeg required to analyze mp3/aif/flac. "
+            "Set ABLETON_MCP_FFMPEG_PATH or install ffmpeg on PATH. "
+            "Attempted: {0}. Detail: {1}".format(attempted_text, probe_message)
         )
 
     decoded_wav_path = _decoded_wav_cache_path(
@@ -757,8 +877,11 @@ def _normalize_inventory_scan_params(scan_params: Optional[Dict[str, Any]]) -> D
             root_name = value.strip()
             if not root_name or root_name in seen_roots:
                 continue
-            seen_roots.add(root_name)
-            roots.append(root_name)
+            canonical_root = _canonicalize_browser_root_name(root_name) or root_name
+            if canonical_root in seen_roots:
+                continue
+            seen_roots.add(canonical_root)
+            roots.append(canonical_root)
     if not roots:
         roots = list(defaults["roots"])
 
@@ -894,7 +1017,14 @@ def _get_or_build_inventory(
             roots=normalized_scan_params["roots"],
             max_depth=normalized_scan_params["max_depth"],
             max_items_per_folder=normalized_scan_params["max_items_per_folder"],
-            include_presets=normalized_scan_params["include_presets"]
+            include_presets=normalized_scan_params["include_presets"],
+            audio_only=False,
+            include_max_for_live_audio=True,
+            response_mode="full",
+            offset=0,
+            limit=50000,
+            use_cache=True,
+            force_refresh=force_refresh,
         )
     except Exception as exc:
         warnings.append(f"inventory_scan_failed:{str(exc)}")
@@ -1195,8 +1325,8 @@ def _get_current_inventory_devices_and_hash(ctx: Context) -> Tuple[Optional[List
     return devices, inventory_hash, None
 
 
-def _decode_audio_samples(file_path: str) -> Tuple[Any, int, int, str]:
-    """Decode audio and return NxC samples, sample rate, channels, and backend."""
+def _decode_audio_samples(file_path: str) -> Tuple[Any, int, int, str, Dict[str, Any]]:
+    """Decode audio and return NxC samples, sample rate, channels, backend, and decode diagnostics."""
     extension = os.path.splitext(file_path)[1].lower()
     if extension not in _SUPPORTED_AUDIO_EXTENSIONS:
         raise SourceAnalysisError(
@@ -1204,24 +1334,113 @@ def _decode_audio_samples(file_path: str) -> Tuple[Any, int, int, str]:
             f"Unsupported audio format '{extension}'. Supported: {sorted(_SUPPORTED_AUDIO_EXTENSIONS)}"
         )
     if np is None:
-        raise SourceAnalysisError("unsupported_decode_backend", "numpy is not available")
+        diagnostics = _audio_dependency_diagnostics()
+        raise SourceAnalysisError(
+            "unsupported_decode_backend",
+            "numpy is not available in this Python runtime "
+            f"({diagnostics.get('python_executable')})"
+        )
 
     decode_errors: List[str] = []
+    attempted_backends: List[str] = []
+
+    base_pipeline = {
+        "python_executable": _safe_text_value(getattr(sys, "executable", None)),
+        "extension": extension,
+        "dependencies": {
+            "numpy_available": np is not None,
+            "soundfile_available": sf is not None,
+            "pydub_available": AudioSegment is not None,
+            "scipy_available": sp_signal is not None,
+            "pyloudnorm_available": pyln is not None,
+        },
+        "ffmpeg_probe": _resolve_ffmpeg_path(),
+    }
 
     if sf is not None:
+        attempted_backends.append("soundfile")
         try:
             decoded, sample_rate = sf.read(file_path, always_2d=True, dtype="float32")
             if decoded.size == 0:
                 raise SourceAnalysisError("decode_failed", "Decoded audio is empty")
             channels = int(decoded.shape[1])
-            return decoded.astype(np.float32), int(sample_rate), channels, "soundfile"
+            pipeline = dict(base_pipeline)
+            pipeline["attempted_backends"] = list(attempted_backends)
+            pipeline["decode"] = {
+                "backend": "soundfile",
+                "fallback_used": False
+            }
+            return decoded.astype(np.float32), int(sample_rate), channels, "soundfile", pipeline
         except SourceAnalysisError:
             raise
         except Exception as exc:
             decode_errors.append(f"soundfile: {str(exc)}")
 
-    if AudioSegment is not None:
+    # WAV fallback path without external decode dependencies.
+    if extension == ".wav":
+        attempted_backends.append("stdlib_wav")
         try:
+            with wave.open(file_path, "rb") as wf:
+                channels = int(wf.getnchannels())
+                sample_rate = int(wf.getframerate())
+                sample_width = int(wf.getsampwidth())
+                frame_count = int(wf.getnframes())
+                if frame_count <= 0 or channels <= 0:
+                    raise SourceAnalysisError("decode_failed", "Decoded audio is empty")
+                raw = wf.readframes(frame_count)
+
+            if sample_width == 1:
+                pcm = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
+                pcm = (pcm - 128.0) / 128.0
+            elif sample_width == 2:
+                pcm = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            elif sample_width == 3:
+                byte_array = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3)
+                signed = (
+                    byte_array[:, 0].astype(np.int32)
+                    | (byte_array[:, 1].astype(np.int32) << 8)
+                    | (byte_array[:, 2].astype(np.int32) << 16)
+                )
+                sign_mask = signed & 0x800000
+                signed = signed - (sign_mask << 1)
+                pcm = signed.astype(np.float32) / 8388608.0
+            elif sample_width == 4:
+                pcm = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+            else:
+                raise SourceAnalysisError(
+                    "decode_failed",
+                    f"Unsupported WAV sample width: {sample_width} bytes"
+                )
+
+            if channels > 1:
+                pcm = pcm.reshape((-1, channels))
+            else:
+                pcm = pcm.reshape((-1, 1))
+
+            if pcm.size == 0:
+                raise SourceAnalysisError("decode_failed", "Decoded audio is empty")
+
+            pipeline = dict(base_pipeline)
+            pipeline["attempted_backends"] = list(attempted_backends)
+            pipeline["decode"] = {
+                "backend": "stdlib_wav",
+                "fallback_used": sf is None
+            }
+            return pcm.astype(np.float32), int(sample_rate), channels, "stdlib_wav", pipeline
+        except SourceAnalysisError:
+            raise
+        except Exception as exc:
+            decode_errors.append(f"stdlib_wav: {str(exc)}")
+
+    if AudioSegment is not None:
+        attempted_backends.append("pydub")
+        try:
+            ffmpeg_probe = _resolve_ffmpeg_path()
+            if ffmpeg_probe.get("available") and isinstance(ffmpeg_probe.get("path"), str):
+                try:
+                    AudioSegment.converter = str(ffmpeg_probe.get("path"))
+                except Exception:
+                    pass
             segment = AudioSegment.from_file(file_path)
             if len(segment) == 0:
                 raise SourceAnalysisError("decode_failed", "Decoded audio is empty")
@@ -1238,21 +1457,116 @@ def _decode_audio_samples(file_path: str) -> Tuple[Any, int, int, str]:
 
             full_scale = float(2 ** max(1, (8 * sample_width - 1)))
             normalized = (pcm / full_scale).astype(np.float32)
-            return normalized, sample_rate, channels, "pydub"
+            pipeline = dict(base_pipeline)
+            pipeline["attempted_backends"] = list(attempted_backends)
+            pipeline["decode"] = {
+                "backend": "pydub",
+                "fallback_used": sf is None
+            }
+            return normalized, sample_rate, channels, "pydub", pipeline
         except SourceAnalysisError:
             raise
         except Exception as exc:
             decode_errors.append(f"pydub: {str(exc)}")
 
-    if extension in {".mp3", ".m4a"} and sf is None and AudioSegment is None:
-        raise SourceAnalysisError(
-            "unsupported_decode_backend",
-            "No decode backend for mp3/m4a (soundfile/pydub unavailable)"
+    # Last-resort fallback: force-decode through ffmpeg to WAV and parse via stdlib.
+    ffmpeg_probe = _resolve_ffmpeg_path()
+    if ffmpeg_probe.get("available") and isinstance(ffmpeg_probe.get("path"), str):
+        attempted_backends.append("ffmpeg_wav_decode")
+        ffmpeg_tmp_path = os.path.join(
+            _ensure_decoded_audio_tmp_dir(),
+            "{0}.wav".format(hashlib.sha256(
+                "{0}|{1}|{2}".format(file_path, os.path.getmtime(file_path), os.path.getsize(file_path)).encode("utf-8")
+            ).hexdigest())
         )
+        cmd = [
+            str(ffmpeg_probe.get("path")),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            file_path,
+            "-vn",
+            "-acodec",
+            "pcm_s16le",
+            ffmpeg_tmp_path,
+        ]
+        try:
+            completed = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120.0
+            )
+            if completed.returncode != 0:
+                stderr = (completed.stderr or "").strip() or "Unknown ffmpeg decode failure"
+                decode_errors.append("ffmpeg_wav_decode: {0}".format(stderr))
+            else:
+                with wave.open(ffmpeg_tmp_path, "rb") as wf:
+                    channels = int(wf.getnchannels())
+                    sample_rate = int(wf.getframerate())
+                    sample_width = int(wf.getsampwidth())
+                    frame_count = int(wf.getnframes())
+                    raw = wf.readframes(frame_count)
+
+                if frame_count <= 0 or channels <= 0:
+                    raise SourceAnalysisError("decode_failed", "Decoded audio is empty")
+
+                if sample_width == 2:
+                    pcm = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                elif sample_width == 1:
+                    pcm = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
+                    pcm = (pcm - 128.0) / 128.0
+                elif sample_width == 3:
+                    byte_array = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3)
+                    signed = (
+                        byte_array[:, 0].astype(np.int32)
+                        | (byte_array[:, 1].astype(np.int32) << 8)
+                        | (byte_array[:, 2].astype(np.int32) << 16)
+                    )
+                    sign_mask = signed & 0x800000
+                    signed = signed - (sign_mask << 1)
+                    pcm = signed.astype(np.float32) / 8388608.0
+                elif sample_width == 4:
+                    pcm = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+                else:
+                    raise SourceAnalysisError(
+                        "decode_failed",
+                        "Unsupported ffmpeg-decoded sample width: {0} bytes".format(sample_width)
+                    )
+
+                if channels > 1:
+                    pcm = pcm.reshape((-1, channels))
+                else:
+                    pcm = pcm.reshape((-1, 1))
+
+                pipeline = dict(base_pipeline)
+                pipeline["attempted_backends"] = list(attempted_backends)
+                pipeline["decode"] = {
+                    "backend": "ffmpeg_wav_decode",
+                    "fallback_used": True
+                }
+                pipeline["ffmpeg_decode_path"] = ffmpeg_tmp_path
+                return pcm.astype(np.float32), int(sample_rate), int(channels), "ffmpeg_wav_decode", pipeline
+        except SourceAnalysisError:
+            raise
+        except Exception as exc:
+            decode_errors.append("ffmpeg_wav_decode: {0}".format(str(exc)))
 
     message = "Failed to decode audio"
     if decode_errors:
         message += f" ({'; '.join(decode_errors)})"
+    diagnostics = _audio_dependency_diagnostics()
+    message += (
+        " | python={0} numpy={1} soundfile={2} pydub={3} ffmpeg={4}".format(
+            diagnostics.get("python_executable"),
+            diagnostics.get("numpy_available"),
+            diagnostics.get("soundfile_available"),
+            diagnostics.get("pydub_available"),
+            diagnostics.get("ffmpeg_path"),
+        )
+    )
     raise SourceAnalysisError("decode_failed", message)
 
 
@@ -1431,7 +1745,7 @@ def _analyze_audio_source(file_path: str, stat_size: int, stat_mtime: float) -> 
     if np is None:
         raise SourceAnalysisError("unsupported_decode_backend", "numpy is not available")
 
-    samples, sample_rate, channels, decode_backend = _decode_audio_samples(file_path)
+    samples, sample_rate, channels, decode_backend, decode_pipeline = _decode_audio_samples(file_path)
     if samples.size == 0:
         raise SourceAnalysisError("decode_failed", "Decoded audio is empty")
 
@@ -1496,7 +1810,7 @@ def _analyze_audio_source(file_path: str, stat_size: int, stat_mtime: float) -> 
         true_peak_dbtp=true_peak_dbtp
     )
 
-    return {
+    result = {
         "ok": True,
         "file_path": file_path,
         "file_exists": True,
@@ -1520,6 +1834,9 @@ def _analyze_audio_source(file_path: str, stat_size: int, stat_mtime: float) -> 
         "summary": summary,
         "analysis_notes": analysis_notes
     }
+    if isinstance(decode_pipeline, dict):
+        result["analysis_pipeline"] = decode_pipeline
+    return result
 
 
 def _series_percentile(values: List[float], pct: float) -> Optional[float]:
@@ -1648,6 +1965,74 @@ def _build_mastering_summary(
     return summary
 
 
+def _extract_top_peak_events(
+    samples: Any,
+    sample_rate: int,
+    sample_peak: float,
+    max_events: int = 20
+) -> Tuple[List[Dict[str, Any]], float]:
+    """Extract compact near-peak/clipped contiguous ranges with timestamps."""
+    if np is None or samples is None or int(samples.size) == 0:
+        return [], 0.0
+
+    frame_peak = np.max(np.abs(samples), axis=1)
+    if frame_peak.size == 0:
+        return [], 0.0
+
+    base_threshold = float(sample_peak) * 0.98
+    clip_or_peak_threshold = min(float(_MASTERING_CLIP_THRESHOLD), float(sample_peak))
+    near_peak_threshold = float(max(base_threshold, clip_or_peak_threshold))
+    if near_peak_threshold <= 0.0:
+        near_peak_threshold = float(sample_peak)
+
+    active_indices = np.where(frame_peak >= near_peak_threshold)[0]
+    if active_indices.size == 0:
+        return [], near_peak_threshold
+
+    ranges: List[Tuple[int, int]] = []
+    start = int(active_indices[0])
+    end = int(active_indices[0])
+    for idx in active_indices[1:]:
+        idx = int(idx)
+        if idx == end + 1:
+            end = idx
+            continue
+        ranges.append((start, end))
+        start = idx
+        end = idx
+    ranges.append((start, end))
+
+    events: List[Dict[str, Any]] = []
+    for start_frame, end_frame in ranges:
+        segment = samples[start_frame:end_frame + 1, :]
+        if int(segment.size) == 0:
+            continue
+        segment_abs = np.abs(segment)
+        peak_offset = np.unravel_index(int(np.argmax(segment_abs)), segment_abs.shape)
+        peak_value = float(segment_abs[peak_offset])
+        peak_channel = int(peak_offset[1])
+        peak_frame = int(start_frame + int(peak_offset[0]))
+        events.append({
+            "start_frame": int(start_frame),
+            "end_frame": int(end_frame),
+            "start_sec": round(float(start_frame) / float(sample_rate), 6),
+            "end_sec": round(float(end_frame) / float(sample_rate), 6),
+            "duration_sec": round(float(max(1, end_frame - start_frame + 1)) / float(sample_rate), 6),
+            "peak_frame": peak_frame,
+            "peak_sec": round(float(peak_frame) / float(sample_rate), 6),
+            "peak": round(peak_value, 6),
+            "peak_dbfs": round(_safe_db(peak_value), 3),
+            "peak_channel": peak_channel,
+            "is_clipped": bool(peak_value >= float(_MASTERING_CLIP_THRESHOLD)),
+            "sample_count": int(max(1, end_frame - start_frame + 1)),
+        })
+
+    events.sort(key=lambda row: (-float(row.get("peak", 0.0)), int(row.get("start_frame", 0))))
+    if max_events > 0 and len(events) > max_events:
+        events = events[:max_events]
+    return events, near_peak_threshold
+
+
 def _analyze_mastering_source(
     file_path: str,
     stat_size: int,
@@ -1665,7 +2050,7 @@ def _analyze_mastering_source(
     if short_term_sec <= 0.0 or momentary_sec <= 0.0:
         raise SourceAnalysisError("invalid_window_sec", "short_term_sec and momentary_sec must be > 0")
 
-    samples, sample_rate, channels, decode_backend = _decode_audio_samples(file_path)
+    samples, sample_rate, channels, decode_backend, decode_pipeline = _decode_audio_samples(file_path)
     if samples.size == 0:
         raise SourceAnalysisError("decode_failed", "Decoded audio is empty")
 
@@ -1681,6 +2066,12 @@ def _analyze_mastering_source(
     mono = samples.mean(axis=1).astype(np.float32)
     sample_peak = float(np.max(np.abs(samples)))
     sample_peak_dbfs = _safe_db(sample_peak)
+    abs_samples = np.abs(samples)
+    peak_flat_index = int(np.argmax(abs_samples))
+    peak_sample_frame, peak_sample_channel = np.unravel_index(peak_flat_index, abs_samples.shape)
+    peak_sample_frame = int(peak_sample_frame)
+    peak_sample_channel = int(peak_sample_channel)
+    peak_sample_time_sec = float(peak_sample_frame) / float(sample_rate) if sample_rate > 0 else 0.0
     rms = float(np.sqrt(np.mean(np.square(mono, dtype=np.float64))))
     rms_dbfs = _safe_db(rms)
     crest_factor_db = float(sample_peak_dbfs - rms_dbfs)
@@ -1802,6 +2193,12 @@ def _analyze_mastering_source(
     inter_sample_peak_risk = bool(
         isinstance(true_peak_dbtp, (int, float)) and true_peak_dbtp > float(true_peak_threshold_dbtp)
     )
+    top_peak_events, near_peak_threshold = _extract_top_peak_events(
+        samples=samples,
+        sample_rate=sample_rate,
+        sample_peak=sample_peak,
+        max_events=20
+    )
 
     max_samples = int(sample_rate * 120)
     analysis_signal = mono[:max_samples] if mono.shape[0] > max_samples else mono
@@ -1830,6 +2227,15 @@ def _analyze_mastering_source(
         inter_sample_peak_risk=inter_sample_peak_risk
     )
 
+    analysis_pipeline: Dict[str, Any] = {}
+    if isinstance(decode_pipeline, dict):
+        analysis_pipeline = dict(decode_pipeline)
+    analysis_pipeline["mastering"] = {
+        "clip_threshold": float(_MASTERING_CLIP_THRESHOLD),
+        "near_peak_threshold": round(float(near_peak_threshold), 6),
+        "true_peak_threshold_dbtp": float(true_peak_threshold_dbtp),
+    }
+
     return {
         "ok": True,
         "file_path": file_path,
@@ -1845,6 +2251,9 @@ def _analyze_mastering_source(
         "momentary_window_sec": round(float(momentary_sec), 6),
         "sample_peak": round(sample_peak, 6),
         "sample_peak_dbfs": round(sample_peak_dbfs, 3),
+        "peak_sample_frame": int(peak_sample_frame),
+        "peak_sample_time_sec": round(float(peak_sample_time_sec), 6),
+        "peak_sample_channel": int(peak_sample_channel),
         "true_peak": round(float(true_peak), 6),
         "true_peak_dbtp": round(float(true_peak_dbtp), 3),
         "rms": round(rms, 6),
@@ -1865,13 +2274,16 @@ def _analyze_mastering_source(
         "dc_offset_l": None if dc_offset_l is None else round(float(dc_offset_l), 8),
         "dc_offset_r": None if dc_offset_r is None else round(float(dc_offset_r), 8),
         "clipped_sample_count": clipped_sample_count,
+        "near_peak_threshold": round(float(near_peak_threshold), 6),
+        "top_peak_events": top_peak_events,
         "inter_sample_peak_risk": inter_sample_peak_risk,
         "true_peak_threshold_dbtp": round(float(true_peak_threshold_dbtp), 3),
         "plr_db": None if plr_db is None else round(float(plr_db), 3),
         "band_energies_db": band_energies_db,
         "resonant_peaks_hz": resonant_peaks_hz,
         "summary": summary,
-        "analysis_notes": notes
+        "analysis_notes": notes,
+        "analysis_pipeline": analysis_pipeline
     }
 
 
@@ -2471,6 +2883,82 @@ def _normalize_browser_token(token: str) -> str:
                 prev_is_sep = True
     normalized_token = "".join(normalized).strip("_")
     return normalized_token
+
+
+def _canonicalize_browser_root_name(raw_name: Any, available_roots: Optional[List[str]] = None) -> Optional[str]:
+    """Resolve human/token root labels to canonical display names."""
+    raw_text = _safe_text_value(raw_name)
+    if not raw_text:
+        return None
+
+    normalized = _normalize_browser_token(raw_text)
+    if not normalized:
+        return None
+
+    alias_hit = _BROWSER_ROOT_ALIAS_MAP.get(normalized)
+    if alias_hit:
+        return alias_hit
+
+    candidate_pool = list(_KNOWN_BROWSER_ROOTS)
+    if isinstance(available_roots, list):
+        for value in available_roots:
+            text = _safe_text_value(value)
+            if text:
+                candidate_pool.append(text)
+
+    for candidate in candidate_pool:
+        candidate_text = _safe_text_value(candidate)
+        if not candidate_text:
+            continue
+        if _normalize_browser_token(candidate_text) == normalized:
+            return candidate_text
+
+    return None
+
+
+def _root_name_to_browser_token(root_name: Any) -> Optional[str]:
+    """Convert canonical root display name to backend path token."""
+    canonical = _canonicalize_browser_root_name(root_name)
+    if not canonical:
+        return None
+    if canonical in _BROWSER_ROOT_TO_TOKEN:
+        return _BROWSER_ROOT_TO_TOKEN[canonical]
+    return _normalize_browser_token(canonical)
+
+
+def _canonicalize_browser_path(path: str) -> str:
+    """Canonicalize browser root segment while preserving child path segments."""
+    if not isinstance(path, str):
+        return path
+    parts = [part for part in path.split("/") if part]
+    if not parts:
+        return path
+    root_token = _root_name_to_browser_token(parts[0])
+    if root_token:
+        parts[0] = root_token
+    return "/".join(parts)
+
+
+def _inventory_item_is_audio_relevant(item: Dict[str, Any], include_max_for_live_audio: bool) -> bool:
+    """Filter inventory entries to audio-effects-focused rows."""
+    path_parts = item.get("path")
+    if not isinstance(path_parts, list) or not path_parts:
+        return False
+
+    root = _safe_text_value(path_parts[0])
+    if root in {"Audio Effects", "Plugins"}:
+        return True
+
+    if root != "Max for Live":
+        return False
+
+    if not include_max_for_live_audio:
+        return False
+
+    if len(path_parts) < 2:
+        return False
+    category = _normalize_browser_token(path_parts[1])
+    return category == "max_audio_effect"
 
 
 def _browser_path_key(parts: List[str]) -> str:
@@ -3207,6 +3695,71 @@ def _collect_device_parameters_for_track(
     }
 
 
+def _sanitize_locator_rows(locators: Any) -> List[Dict[str, Any]]:
+    """Normalize locator rows for stable API payloads."""
+    rows: List[Dict[str, Any]] = []
+    if not isinstance(locators, list):
+        return rows
+
+    for idx, row in enumerate(locators):
+        if not isinstance(row, dict):
+            continue
+        time_beats = _safe_float_value(row.get("time_beats"))
+        if time_beats is None:
+            continue
+        row_index = _safe_int_value(row.get("index"))
+        if row_index is None:
+            row_index = idx
+        name = _safe_text_value(row.get("name")) or f"Locator {int(row_index) + 1}"
+        rows.append(
+            {
+                "index": int(row_index),
+                "name": name,
+                "time_beats": float(time_beats),
+            }
+        )
+
+    rows.sort(key=lambda item: (float(item.get("time_beats", 0.0)), int(item.get("index", 0))))
+    for idx, row in enumerate(rows):
+        row["index"] = int(idx)
+    return rows
+
+
+def _locator_neighbors(
+    locators: List[Dict[str, Any]],
+    current_song_time_beats: Optional[float],
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Return previous/next locator for current song time."""
+    if not isinstance(locators, list) or current_song_time_beats is None:
+        return None, None
+
+    previous_locator = None
+    next_locator = None
+    for row in locators:
+        time_value = _safe_float_value(row.get("time_beats"))
+        if time_value is None:
+            continue
+        if time_value <= current_song_time_beats:
+            previous_locator = row
+        if time_value > current_song_time_beats:
+            next_locator = row
+            break
+    return previous_locator, next_locator
+
+
+def _inject_session_locator_summary(session_payload: Dict[str, Any], locator_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Inject additive locator summary fields into session payload."""
+    if not isinstance(session_payload, dict):
+        return session_payload
+    out = dict(session_payload)
+
+    locators = _sanitize_locator_rows(locator_payload.get("locators"))
+    out["has_time_locators"] = bool(len(locators) > 0)
+    out["time_locator_count"] = int(len(locators))
+    out["time_locators_preview"] = list(locators[:5])
+    return out
+
+
 # Core Tool endpoints
 
 @mcp.tool()
@@ -3215,10 +3768,123 @@ def get_session_info(ctx: Context) -> str:
     try:
         ableton = get_ableton_connection()
         result = ableton.send_command("get_session_info")
+        if isinstance(result, dict):
+            has_locator_fields = (
+                "has_time_locators" in result
+                and "time_locator_count" in result
+                and "time_locators_preview" in result
+            )
+            if not has_locator_fields:
+                locator_payload = get_time_locators(ctx, include_als_fallback=True)
+                if isinstance(locator_payload, dict):
+                    result = _inject_session_locator_summary(result, locator_payload)
         return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"Error getting session info from Ableton: {str(e)}")
         return f"Error getting session info: {str(e)}"
+
+
+@mcp.tool()
+def get_time_locators(
+    ctx: Context,
+    als_file_path: Optional[str] = None,
+    include_als_fallback: bool = True,
+) -> Dict[str, Any]:
+    """
+    Return timeline locator/cue-point visibility from Live runtime with optional .als fallback.
+    """
+    _ = ctx
+
+    warnings: List[str] = []
+    runtime_payload: Optional[Dict[str, Any]] = None
+    runtime_error: Optional[str] = None
+    current_song_time_beats: Optional[float] = None
+
+    try:
+        ableton = get_ableton_connection()
+        runtime_candidate = ableton.send_command("get_time_locators")
+        if isinstance(runtime_candidate, dict):
+            runtime_payload = dict(runtime_candidate)
+            current_song_time_beats = _safe_float_value(
+                runtime_payload.get("current_song_time_beats")
+                if runtime_payload.get("current_song_time_beats") is not None
+                else runtime_payload.get("current_song_time_sec")
+            )
+    except Exception as exc:
+        runtime_error = str(exc)
+
+    if runtime_payload is not None:
+        runtime_locators = _sanitize_locator_rows(runtime_payload.get("locators"))
+        runtime_supported = bool(runtime_payload.get("supported")) and bool(runtime_payload.get("ok"))
+        if runtime_supported:
+            previous_locator = runtime_payload.get("previous_locator")
+            next_locator = runtime_payload.get("next_locator")
+            if current_song_time_beats is not None:
+                inferred_previous, inferred_next = _locator_neighbors(runtime_locators, current_song_time_beats)
+                if inferred_previous is not None:
+                    previous_locator = inferred_previous
+                if inferred_next is not None:
+                    next_locator = inferred_next
+
+            payload: Dict[str, Any] = {
+                "ok": True,
+                "supported": True,
+                "source": "runtime",
+                "locators": runtime_locators,
+                "locator_count": int(len(runtime_locators)),
+                "warnings": list(runtime_payload.get("warnings") or []),
+            }
+            if current_song_time_beats is not None:
+                payload["current_song_time_beats"] = float(current_song_time_beats)
+            if isinstance(previous_locator, dict):
+                payload["previous_locator"] = previous_locator
+            if isinstance(next_locator, dict):
+                payload["next_locator"] = next_locator
+            return payload
+
+        runtime_reason = _safe_text_value(runtime_payload.get("reason")) or "runtime_locator_unavailable"
+        warnings.append(runtime_reason)
+
+    if runtime_error:
+        warnings.append("runtime_locator_error:{0}".format(runtime_error))
+
+    if not include_als_fallback:
+        return {
+            "ok": True,
+            "supported": False,
+            "source": "runtime",
+            "reason": warnings[-1] if warnings else "runtime_locator_unavailable",
+            "locators": [],
+            "locator_count": 0,
+            "warnings": warnings,
+        }
+
+    project_root = get_project_root()
+    fallback = read_time_locators_from_project_als(project_root=project_root, als_file_path=als_file_path)
+    if not isinstance(fallback, dict):
+        return {
+            "ok": False,
+            "error": "locator_fallback_failed",
+            "message": "ALS locator fallback returned invalid payload",
+            "warnings": warnings,
+        }
+
+    fallback_payload = dict(fallback)
+    fallback_payload["warnings"] = list(warnings) + list(fallback_payload.get("warnings") or [])
+    if fallback_payload.get("ok") is not True:
+        return fallback_payload
+
+    fallback_locators = _sanitize_locator_rows(fallback_payload.get("locators"))
+    fallback_payload["locators"] = fallback_locators
+    fallback_payload["locator_count"] = int(len(fallback_locators))
+    if fallback_payload.get("source") is None:
+        fallback_payload["source"] = "als_file"
+    if current_song_time_beats is not None:
+        fallback_payload["current_song_time_beats"] = float(current_song_time_beats)
+        previous_locator, next_locator = _locator_neighbors(fallback_locators, current_song_time_beats)
+        fallback_payload["previous_locator"] = previous_locator
+        fallback_payload["next_locator"] = next_locator
+    return fallback_payload
 
 @mcp.tool()
 def get_track_info(ctx: Context, track_index: int) -> str:
@@ -3524,9 +4190,14 @@ def get_browser_items_at_path(ctx: Context, path: str) -> str:
     """
     try:
         ableton = get_ableton_connection()
+        canonical_path = _canonicalize_browser_path(path)
         result = ableton.send_command("get_browser_items_at_path", {
-            "path": path
+            "path": canonical_path
         })
+        if isinstance(result, dict):
+            result = dict(result)
+            result["requested_path"] = path
+            result["resolved_path"] = canonical_path
         
         # Check if there was an error with available categories
         if "error" in result and "available_categories" in result:
@@ -4012,16 +4683,35 @@ def get_master_track_device_chain(ctx: Context) -> Dict[str, Any]:
 
 
 @mcp.tool()
-def get_track_device_chain(ctx: Context, track_index: int) -> Dict[str, Any]:
+def get_track_device_chain(
+    ctx: Context,
+    track_index: int,
+    include_nested: bool = False,
+    max_depth: int = 4
+) -> Dict[str, Any]:
     """
     Get ordered device chain metadata for a track.
 
     Parameters:
     - track_index: 0-based track index
+    - include_nested: include rack-contained nested devices
+    - max_depth: nested rack traversal depth (when include_nested=True)
     """
     try:
+        max_depth_value = int(max_depth)
+    except Exception:
+        max_depth_value = 4
+
+    try:
         ableton = get_ableton_connection()
-        result = ableton.send_command("get_track_devices", {"track_index": track_index})
+        result = ableton.send_command(
+            "get_track_devices",
+            {
+                "track_index": track_index,
+                "include_nested": bool(include_nested),
+                "max_depth": max_depth_value,
+            },
+        )
         if isinstance(result, dict):
             if "ok" not in result:
                 result = dict(result)
@@ -4035,6 +4725,8 @@ def get_track_device_chain(ctx: Context, track_index: int) -> Dict[str, Any]:
             "track_index": track_index,
             "debug": {
                 "backend_command": "get_track_devices",
+                "include_nested": bool(include_nested),
+                "max_depth": max_depth_value,
                 "backend_result_type": str(type(result))
             }
         }
@@ -4044,7 +4736,9 @@ def get_track_device_chain(ctx: Context, track_index: int) -> Dict[str, Any]:
             "ok": False,
             "error": "get_track_device_chain_failed",
             "message": str(e),
-            "track_index": track_index
+            "track_index": track_index,
+            "include_nested": bool(include_nested),
+            "max_depth": max_depth_value,
         }
 
 
@@ -4054,7 +4748,8 @@ def get_device_parameters(
     track_index: int,
     device_index: int,
     offset: int = 0,
-    limit: int = 64
+    limit: int = 64,
+    device_path: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """
     Get paged device parameters for a track device.
@@ -4064,6 +4759,7 @@ def get_device_parameters(
     - device_index: 0-based device index on the track
     - offset: parameter offset
     - limit: page size
+    - device_path: optional nested path [top_device, chain, device, ...]
     """
     try:
         offset_value = int(offset)
@@ -4079,14 +4775,61 @@ def get_device_parameters(
             "limit": limit
         }
 
+    device_path_value = None
+    if device_path is not None:
+        if not isinstance(device_path, list) or not device_path:
+            return {
+                "ok": False,
+                "error": "invalid_device_path",
+                "message": "device_path must be a non-empty list of integers when provided",
+                "track_index": track_index,
+                "device_index": device_index,
+                "device_path": device_path,
+            }
+        parsed_path: List[int] = []
+        for value in device_path:
+            parsed_value = _safe_int_value(value)
+            if parsed_value is None:
+                return {
+                    "ok": False,
+                    "error": "invalid_device_path",
+                    "message": "device_path entries must be integers",
+                    "track_index": track_index,
+                    "device_index": device_index,
+                    "device_path": device_path,
+                }
+            parsed_path.append(int(parsed_value))
+        if parsed_path[0] != int(device_index):
+            return {
+                "ok": False,
+                "error": "device_path_mismatch",
+                "message": "device_path[0] must match device_index",
+                "track_index": track_index,
+                "device_index": int(device_index),
+                "device_path": parsed_path,
+            }
+        if len(parsed_path) % 2 == 0:
+            return {
+                "ok": False,
+                "error": "invalid_device_path",
+                "message": "device_path must have odd length [top_device, chain, device, ...]",
+                "track_index": track_index,
+                "device_index": int(device_index),
+                "device_path": parsed_path,
+            }
+        device_path_value = parsed_path
+
     try:
         ableton = get_ableton_connection()
-        result = ableton.send_command("get_device_parameters", {
+        command_payload = {
             "track_index": track_index,
             "device_index": device_index,
             "offset": offset_value,
             "limit": limit_value
-        })
+        }
+        if isinstance(device_path_value, list):
+            command_payload["device_path"] = device_path_value
+        result = ableton.send_command("get_device_parameters", command_payload)
         if isinstance(result, dict):
             if "ok" not in result:
                 result = dict(result)
@@ -4101,6 +4844,7 @@ def get_device_parameters(
             "device_index": device_index,
             "offset": offset_value,
             "limit": limit_value,
+            "device_path": device_path_value,
             "debug": {
                 "backend_command": "get_device_parameters",
                 "backend_result_type": str(type(result))
@@ -4115,7 +4859,8 @@ def get_device_parameters(
             "track_index": track_index,
             "device_index": device_index,
             "offset": offset_value,
-            "limit": limit_value
+            "limit": limit_value,
+            "device_path": device_path_value
         }
 
 @mcp.tool()
@@ -5038,7 +5783,14 @@ def get_device_inventory(
     roots: Optional[List[str]] = None,
     max_depth: int = 5,
     max_items_per_folder: int = 500,
-    include_presets: bool = False
+    include_presets: bool = False,
+    audio_only: bool = False,
+    include_max_for_live_audio: bool = True,
+    response_mode: str = "compact",
+    offset: int = 0,
+    limit: int = 200,
+    use_cache: bool = True,
+    force_refresh: bool = False,
 ) -> Dict[str, Any]:
     """
     Enumerate loadable devices/effects/instruments from Ableton's browser.
@@ -5048,8 +5800,37 @@ def get_device_inventory(
     - max_depth: Maximum recursive folder depth
     - max_items_per_folder: Hard cap per folder scan
     - include_presets: Include clearly preset/rack items when True
+    - audio_only: Include only audio-relevant items (Audio Effects, Plugins, optional Max for Live audio effects)
+    - include_max_for_live_audio: Include Max for Live > Max Audio Effect rows when audio_only=True
+    - response_mode: "compact" (paged, default) or "full"
+    - offset: Pagination offset used when response_mode="compact"
+    - limit: Pagination page size used when response_mode="compact"
+    - use_cache: Reuse runtime cache for identical scan params
+    - force_refresh: Ignore cache and rescan browser
     """
+    _ = ctx
     try:
+        if roots is not None and not isinstance(roots, list):
+            return {
+                "ok": False,
+                "error": "invalid_roots_type",
+                "message": "roots must be a list of strings",
+                "roots_type": str(type(roots)),
+            }
+
+        response_mode_value = (_safe_text_value(response_mode) or "compact").lower()
+        if response_mode_value not in {"compact", "full"}:
+            response_mode_value = "compact"
+
+        try:
+            offset_value = max(0, int(offset))
+        except Exception:
+            offset_value = 0
+        try:
+            limit_value = max(1, int(limit))
+        except Exception:
+            limit_value = 200
+
         ableton = get_ableton_connection()
         browser_tree = ableton.send_command("get_browser_tree", {"category_type": "all"})
         if not isinstance(browser_tree, dict) or not browser_tree:
@@ -5076,8 +5857,7 @@ def get_device_inventory(
 
         overall_item_cap = 5000
         max_folder_calls = 300
-        folder_calls = 0
-        scanned_roots: List[str] = []
+
         discovered_roots = [entry.get("display_name") for entry in root_entries if isinstance(entry.get("display_name"), str)]
         available_roots: List[str] = []
         seen_available_roots = set()
@@ -5089,228 +5869,328 @@ def get_device_inventory(
                 continue
             seen_available_roots.add(normalized_name)
             available_roots.append(normalized_name)
-        devices: List[Dict[str, Any]] = []
-        folders_truncated: List[Dict[str, Any]] = []
-        errors: List[Dict[str, Any]] = []
-        truncated = False
-
-        device_dedupe_keys = set()
-        visited_folders = set()
-
-        root_lookup = {
-            entry["display_name"]: entry
-            for entry in root_entries
-            if isinstance(entry.get("display_name"), str)
-        }
-        for root_name in _KNOWN_BROWSER_ROOTS:
-            if root_name in root_lookup:
-                continue
-            root_lookup[root_name] = {
-                "display_name": root_name,
-                "path_candidates": [f"query:{root_name}", root_name, _normalize_browser_token(root_name)]
-            }
-
         if roots is None:
-            requested_roots = ["Audio Effects", "Plugins"]
-        elif isinstance(roots, list):
-            requested_roots = [
-                value.strip() for value in roots
+            requested_roots_raw = ["Audio Effects", "Plugins"]
+        else:
+            requested_roots_raw = [
+                value.strip()
+                for value in roots
                 if isinstance(value, str) and value.strip()
             ]
-        else:
-            requested_roots = []
 
+        # Canonicalize requested roots while preserving not-found diagnostics by original input token.
+        requested_roots: List[str] = []
+        roots_not_found: List[str] = []
         seen_requested = set()
-        deduped_requested_roots: List[str] = []
-        for root_name in requested_roots:
-            if root_name in seen_requested:
+        for raw_value in requested_roots_raw:
+            canonical = _canonicalize_browser_root_name(raw_value, available_roots=available_roots)
+            if not canonical:
+                roots_not_found.append(raw_value)
                 continue
-            seen_requested.add(root_name)
-            deduped_requested_roots.append(root_name)
-        requested_roots = deduped_requested_roots
+            if canonical in seen_requested:
+                continue
+            seen_requested.add(canonical)
+            requested_roots.append(canonical)
 
-        valid_roots = [root_name for root_name in requested_roots if root_name in root_lookup]
-        roots_not_found = [root_name for root_name in requested_roots if root_name not in root_lookup]
+        # Build root lookup map with canonical display names and tokenized path candidates.
+        root_lookup: Dict[str, Dict[str, Any]] = {}
+        for entry in root_entries:
+            display = _safe_text_value(entry.get("display_name"))
+            canonical_display = _canonicalize_browser_root_name(display, available_roots=available_roots) or display
+            if not canonical_display:
+                continue
+            target = root_lookup.get(canonical_display)
+            if not isinstance(target, dict):
+                target = {"display_name": canonical_display, "path_candidates": []}
+                root_lookup[canonical_display] = target
+            path_candidates = entry.get("path_candidates", [])
+            if isinstance(path_candidates, list):
+                for candidate in path_candidates:
+                    candidate_text = _safe_text_value(candidate)
+                    if candidate_text and candidate_text not in target["path_candidates"]:
+                        target["path_candidates"].append(candidate_text)
+            root_token = _root_name_to_browser_token(canonical_display)
+            for candidate in [canonical_display, root_token, _normalize_browser_token(canonical_display)]:
+                candidate_text = _safe_text_value(candidate)
+                if candidate_text and candidate_text not in target["path_candidates"]:
+                    target["path_candidates"].append(candidate_text)
 
-        def fetch_folder(path_key_parts: List[str]) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
-            nonlocal folder_calls
-            if folder_calls >= max_folder_calls:
-                return None, "max_folder_calls"
-            folder_calls += 1
-            path_string = "/".join(path_key_parts)
-            try:
-                response = ableton.send_command("get_browser_items_at_path", {"path": path_string})
-            except Exception as exc:
-                return None, str(exc)
+        for known_root in _KNOWN_BROWSER_ROOTS:
+            if known_root in root_lookup:
+                continue
+            root_lookup[known_root] = {
+                "display_name": known_root,
+                "path_candidates": [
+                    value
+                    for value in [
+                        known_root,
+                        _root_name_to_browser_token(known_root),
+                        _normalize_browser_token(known_root),
+                    ]
+                    if _safe_text_value(value)
+                ],
+            }
 
-            if not isinstance(response, dict):
-                return None, f"invalid_response_type:{type(response)}"
-            if response.get("error"):
-                return None, str(response.get("error"))
+        unresolved_requested = [name for name in requested_roots if name not in root_lookup]
+        for unresolved in unresolved_requested:
+            if unresolved not in roots_not_found:
+                roots_not_found.append(unresolved)
+        valid_roots = [name for name in requested_roots if name in root_lookup]
 
-            items = response.get("items", [])
-            if not isinstance(items, list):
-                return [], None
-            normalized_items = [item for item in items if isinstance(item, dict)]
-            return normalized_items, None
+        scan_params = _normalize_inventory_scan_params(
+            {
+                "roots": valid_roots,
+                "max_depth": depth_limit,
+                "max_items_per_folder": items_per_folder_limit,
+                "include_presets": bool(include_presets),
+            }
+        )
+        runtime_cache_key = _scan_params_key(scan_params)
+        cached_scan_payload = _DEVICE_INVENTORY_RUNTIME_CACHE.get(runtime_cache_key)
+        cache_hit = bool(
+            use_cache
+            and not force_refresh
+            and isinstance(cached_scan_payload, dict)
+            and isinstance(cached_scan_payload.get("devices"), list)
+        )
 
-        def fetch_root_folder(root_entry: Dict[str, Any]) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str], Optional[str]]:
-            path_candidates = root_entry.get("path_candidates", [])
-            if not isinstance(path_candidates, list):
-                return None, None, "no_path_candidates"
+        scan_payload: Optional[Dict[str, Any]] = copy.deepcopy(cached_scan_payload) if cache_hit else None
 
-            last_error: Optional[str] = None
-            seen_candidates = set()
-            for value in path_candidates:
-                if not isinstance(value, str):
-                    continue
-                candidate = value.strip()
-                if not candidate or candidate in seen_candidates:
-                    continue
-                seen_candidates.add(candidate)
+        if scan_payload is None:
+            folder_calls = 0
+            scanned_roots: List[str] = []
+            devices: List[Dict[str, Any]] = []
+            folders_truncated: List[Dict[str, Any]] = []
+            errors: List[Dict[str, Any]] = []
+            truncated = False
+            device_dedupe_keys = set()
+            visited_folders = set()
 
-                items, error = fetch_folder([candidate])
-                if error is None:
-                    return items, candidate, None
-                if error == "max_folder_calls":
-                    return None, None, error
-                last_error = error
+            def fetch_folder(path_key_parts: List[str]) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+                nonlocal folder_calls
+                if folder_calls >= max_folder_calls:
+                    return None, "max_folder_calls"
+                folder_calls += 1
 
-            return None, None, last_error or "root_not_resolvable"
+                path_string = "/".join(path_key_parts)
+                path_string = _canonicalize_browser_path(path_string)
+                try:
+                    response = ableton.send_command("get_browser_items_at_path", {"path": path_string})
+                except Exception as exc:
+                    return None, str(exc)
 
-        def traverse_folder(
-            path_key_parts: List[str],
-            path_display_parts: List[str],
-            depth: int,
-            prefetched_items: Optional[List[Dict[str, Any]]] = None
-        ) -> None:
-            nonlocal truncated
-            if truncated:
-                return
+                if not isinstance(response, dict):
+                    return None, f"invalid_response_type:{type(response)}"
+                if response.get("error"):
+                    return None, str(response.get("error"))
 
-            folder_key = _browser_path_key(path_display_parts)
-            if folder_key in visited_folders:
-                return
-            visited_folders.add(folder_key)
+                items = response.get("items", [])
+                if not isinstance(items, list):
+                    return [], None
+                normalized_items = [item for item in items if isinstance(item, dict)]
+                return normalized_items, None
 
-            items = prefetched_items
-            if items is None:
-                fetched_items, error = fetch_folder(path_key_parts)
-                if error is not None:
+            def fetch_root_folder(root_entry: Dict[str, Any]) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str], Optional[str]]:
+                path_candidates = root_entry.get("path_candidates", [])
+                if not isinstance(path_candidates, list):
+                    return None, None, "no_path_candidates"
+
+                last_error: Optional[str] = None
+                seen_candidates = set()
+                for value in path_candidates:
+                    candidate = _safe_text_value(value)
+                    if not candidate or candidate in seen_candidates:
+                        continue
+                    seen_candidates.add(candidate)
+                    candidate_path = _canonicalize_browser_path(candidate)
+                    items, error = fetch_folder([candidate_path])
+                    if error is None:
+                        return items, candidate_path, None
                     if error == "max_folder_calls":
-                        truncated = True
-                        folders_truncated.append({
-                            "path": path_display_parts,
-                            "reason": "max_folder_calls"
-                        })
-                        return
-                    errors.append({
-                        "path": path_display_parts,
-                        "error": error
-                    })
+                        return None, None, error
+                    last_error = error
+
+                return None, None, last_error or "root_not_resolvable"
+
+            def traverse_folder(
+                path_key_parts: List[str],
+                path_display_parts: List[str],
+                depth: int,
+                prefetched_items: Optional[List[Dict[str, Any]]] = None,
+            ) -> None:
+                nonlocal truncated
+                if truncated:
                     return
-                items = fetched_items or []
 
-            if len(items) > items_per_folder_limit:
-                folders_truncated.append({
-                    "path": path_display_parts,
-                    "reason": "max_items_per_folder"
-                })
-                items = items[:items_per_folder_limit]
+                folder_key = _browser_path_key(path_display_parts)
+                if folder_key in visited_folders:
+                    return
+                visited_folders.add(folder_key)
 
-            for item in items:
+                items = prefetched_items
+                if items is None:
+                    fetched_items, error = fetch_folder(path_key_parts)
+                    if error is not None:
+                        if error == "max_folder_calls":
+                            truncated = True
+                            folders_truncated.append({"path": path_display_parts, "reason": "max_folder_calls"})
+                            return
+                        errors.append({"path": path_display_parts, "error": error})
+                        return
+                    items = fetched_items or []
+
+                if len(items) > items_per_folder_limit:
+                    folders_truncated.append({"path": path_display_parts, "reason": "max_items_per_folder"})
+                    items = items[:items_per_folder_limit]
+
+                for item in items:
+                    if truncated:
+                        break
+
+                    item_name = _safe_text_value(item.get("name"))
+                    if not item_name:
+                        continue
+                    item_display_path = path_display_parts + [item_name]
+                    is_loadable = _safe_bool(item.get("is_loadable"))
+                    is_folder = _safe_bool(item.get("is_folder"))
+
+                    if is_loadable:
+                        if include_presets or not _is_clearly_preset_item(item, item_name):
+                            item_id = None
+                            for id_key in ("id", "item_id", "uri"):
+                                id_value = item.get(id_key)
+                                if isinstance(id_value, (str, int)):
+                                    item_id = str(id_value)
+                                    break
+
+                            dedupe_key = item_id or _browser_path_key(item_display_path)
+                            if dedupe_key not in device_dedupe_keys:
+                                device_dedupe_keys.add(dedupe_key)
+                                devices.append(
+                                    {
+                                        "name": item_name,
+                                        "path": item_display_path,
+                                        "item_id": item_id,
+                                        "item_type": _infer_inventory_item_type(item, item_name),
+                                    }
+                                )
+                                if len(devices) >= overall_item_cap:
+                                    truncated = True
+                                    break
+
+                    if is_folder and depth < depth_limit and not truncated:
+                        traverse_folder(
+                            path_key_parts=path_key_parts + [item_name],
+                            path_display_parts=item_display_path,
+                            depth=depth + 1,
+                        )
+
+            for root_name in valid_roots:
                 if truncated:
                     break
 
-                item_name = item.get("name")
-                if not isinstance(item_name, str) or not item_name.strip():
+                root_entry = root_lookup.get(root_name)
+                if not isinstance(root_entry, dict):
                     continue
-                item_name = item_name.strip()
 
-                item_display_path = path_display_parts + [item_name]
-                is_loadable = _safe_bool(item.get("is_loadable"))
-                is_folder = _safe_bool(item.get("is_folder"))
+                root_items, resolved_root_path, root_error = fetch_root_folder(root_entry)
+                if root_error is not None:
+                    if root_error == "max_folder_calls":
+                        truncated = True
+                        folders_truncated.append({"path": [root_name], "reason": "max_folder_calls"})
+                        break
+                    errors.append({"path": [root_name], "error": root_error})
+                    continue
 
-                if is_loadable:
-                    if include_presets or not _is_clearly_preset_item(item, item_name):
-                        item_id = None
-                        for id_key in ("id", "item_id", "uri"):
-                            id_value = item.get(id_key)
-                            if isinstance(id_value, (str, int)):
-                                item_id = str(id_value)
-                                break
+                if not isinstance(resolved_root_path, str) or not resolved_root_path.strip():
+                    errors.append({"path": [root_name], "error": "root_not_resolvable"})
+                    continue
 
-                        dedupe_key = item_id or _browser_path_key(item_display_path)
-                        if dedupe_key not in device_dedupe_keys:
-                            device_dedupe_keys.add(dedupe_key)
-                            devices.append({
-                                "name": item_name,
-                                "path": item_display_path,
-                                "item_id": item_id,
-                                "item_type": _infer_inventory_item_type(item, item_name)
-                            })
+                scanned_roots.append(root_name)
+                traverse_folder(
+                    path_key_parts=[resolved_root_path],
+                    path_display_parts=[root_name],
+                    depth=0,
+                    prefetched_items=root_items,
+                )
 
-                            if len(devices) >= overall_item_cap:
-                                truncated = True
-                                break
+            scan_payload = {
+                "requested_roots": list(requested_roots),
+                "available_roots": list(available_roots),
+                "scanned_roots": scanned_roots,
+                "roots_not_found": list(roots_not_found),
+                "max_depth": depth_limit,
+                "max_items_per_folder": items_per_folder_limit,
+                "include_presets": bool(include_presets),
+                "truncated": bool(truncated),
+                "folders_truncated": folders_truncated,
+                "devices": devices,
+                "errors": errors,
+            }
+            if use_cache:
+                _DEVICE_INVENTORY_RUNTIME_CACHE[runtime_cache_key] = copy.deepcopy(scan_payload)
 
-                if is_folder and depth < depth_limit and not truncated:
-                    traverse_folder(
-                        path_key_parts=path_key_parts + [item_name],
-                        path_display_parts=item_display_path,
-                        depth=depth + 1
-                    )
+        if not isinstance(scan_payload, dict):
+            return {
+                "ok": False,
+                "error": "device_inventory_failed",
+                "message": "inventory scan payload missing",
+            }
 
-        for root_name in valid_roots:
-            if truncated:
-                break
+        devices_all = scan_payload.get("devices", [])
+        if not isinstance(devices_all, list):
+            devices_all = []
+        devices_filtered = [item for item in devices_all if isinstance(item, dict)]
 
-            root_entry = root_lookup.get(root_name)
-            if not isinstance(root_entry, dict):
-                continue
+        if bool(audio_only):
+            devices_filtered = [
+                item for item in devices_filtered
+                if _inventory_item_is_audio_relevant(item, include_max_for_live_audio=bool(include_max_for_live_audio))
+            ]
 
-            root_items, resolved_root_path, root_error = fetch_root_folder(root_entry)
-            if root_error is not None:
-                if root_error == "max_folder_calls":
-                    truncated = True
-                    folders_truncated.append({
-                        "path": [root_name],
-                        "reason": "max_folder_calls"
-                    })
-                    break
-                errors.append({
-                    "path": [root_name],
-                    "error": root_error
-                })
-                continue
-
-            if not isinstance(resolved_root_path, str) or not resolved_root_path.strip():
-                errors.append({
-                    "path": [root_name],
-                    "error": "root_not_resolvable"
-                })
-                continue
-
-            scanned_roots.append(root_name)
-            traverse_folder(
-                path_key_parts=[resolved_root_path],
-                path_display_parts=[root_name],
-                depth=0,
-                prefetched_items=root_items
+        devices_filtered.sort(
+            key=lambda row: (
+                (_safe_text_value(row.get("name")) or "").lower(),
+                _browser_path_key(row.get("path", [])) if isinstance(row.get("path"), list) else "",
             )
+        )
+
+        total_devices = len(devices_filtered)
+        if response_mode_value == "full":
+            paged_devices = devices_filtered
+            returned_count = total_devices
+            has_more = False
+        else:
+            start = min(offset_value, total_devices)
+            end = min(total_devices, start + limit_value)
+            paged_devices = devices_filtered[start:end]
+            returned_count = len(paged_devices)
+            has_more = bool(end < total_devices)
 
         return {
             "ok": True,
-            "requested_roots": requested_roots,
-            "available_roots": available_roots,
-            "scanned_roots": scanned_roots,
-            "roots_not_found": roots_not_found,
-            "max_depth": depth_limit,
+            "requested_roots": requested_roots_raw,
+            "normalized_requested_roots": scan_payload.get("requested_roots", requested_roots),
+            "available_roots": scan_payload.get("available_roots", available_roots),
+            "scanned_roots": scan_payload.get("scanned_roots", []),
+            "roots_not_found": scan_payload.get("roots_not_found", roots_not_found),
+            "max_depth": scan_payload.get("max_depth", depth_limit),
+            "max_items_per_folder": scan_payload.get("max_items_per_folder", items_per_folder_limit),
             "include_presets": bool(include_presets),
-            "truncated": truncated,
-            "folders_truncated": folders_truncated,
-            "devices": devices,
-            "errors": errors
+            "audio_only": bool(audio_only),
+            "include_max_for_live_audio": bool(include_max_for_live_audio),
+            "response_mode": response_mode_value,
+            "offset": int(offset_value),
+            "limit": int(limit_value),
+            "total_devices": int(total_devices),
+            "returned_count": int(returned_count),
+            "has_more": bool(has_more),
+            "cache_hit": bool(cache_hit),
+            "cache_key": runtime_cache_key,
+            "truncated": bool(scan_payload.get("truncated", False)),
+            "folders_truncated": scan_payload.get("folders_truncated", []),
+            "devices": paged_devices,
+            "errors": scan_payload.get("errors", []),
         }
     except Exception as e:
         logger.error(f"Error getting device inventory: {str(e)}")

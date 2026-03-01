@@ -133,6 +133,23 @@ From any folder you can verify import/tool registration with:
 /Users/mikeonator/Documents/Code/ableton-mcp-analysis/scripts/mcp_healthcheck.sh
 ```
 
+### Default Test Gate (Pre-Push)
+
+Use this as the default validation command before push:
+
+```bash
+/Users/mikeonator/Documents/Code/ableton-mcp-analysis/scripts/test_gate.sh
+```
+
+This intentionally runs unittest discovery from `tests/` only, which avoids importing
+Ableton-only Remote Script modules (`_Framework`) during local Python test runs.
+
+Optional one-time install for a local git pre-push hook:
+
+```bash
+/Users/mikeonator/Documents/Code/ableton-mcp-analysis/scripts/install_pre_push_hook.sh
+```
+
 ### Export-based ears (no loopback)
 
 This repo supports a file-based analysis workflow for reliable signal awareness without BlackHole/loopback routing:
@@ -145,6 +162,13 @@ This repo supports a file-based analysis workflow for reliable signal awareness 
 
 `analyze_audio_file` supports `.wav` natively and `.mp3`, `.aif/.aiff`, `.flac` (plus `.m4a` where available)
 by decoding non-WAV inputs to `AbletonMCP/analysis/tmp_decoded/` with `ffmpeg`.
+
+`ffmpeg` resolution order:
+- `ABLETON_MCP_FFMPEG_PATH` (explicit executable path override)
+- `ffmpeg` from `PATH`
+
+When decode dependencies are missing in the active Python runtime, analysis responses now include
+explicit pipeline diagnostics (backend + dependency availability + Python executable) instead of silent fallbacks.
 
 Mandatory protocol for model agents:
 - If audio analysis is requested and no `wav_path` is available, agents must use:
@@ -172,6 +196,7 @@ Once the config file has been set on Claude, and the remote script is running in
 ## Capabilities
 
 - Get session and track information
+- Read timeline locators/cue points (`get_time_locators`) with runtime-first + `.als` fallback
 - Inspect routing/topology for tracks, returns, sends, buses, and master (`get_mix_topology`, `get_send_matrix`)
 - Inspect return-track and master device chains (`get_return_tracks_info`, `get_master_track_device_chain`)
 - Create and modify MIDI and audio tracks
@@ -180,7 +205,9 @@ Once the config file has been set on Claude, and the remote script is running in
 - Load instruments and effects from Ableton's browser
 - Add notes to MIDI clips
 - Change tempo and other session parameters
-- Inspect device parameters (`get_device_parameters`)
+- Inspect device chains including nested racks (`get_track_device_chain(include_nested=true)`)
+- Inspect device parameters (`get_device_parameters`) including nested paths via `device_path=[top, chain, device, ...]`
+- Enumerate browser inventory with compact paging and root normalization (`get_device_inventory`)
 - Export-based audio analysis for mix checks and mastering metrics (`analyze_export_job`, `analyze_mastering_file`)
 - Source inventory + spectral/loudness summaries for arrangement clips (`index_sources_from_live_set`)
 - Mix/master context helpers for LLM guidance (`build_mix_context_profile`, `build_mix_master_context`)
@@ -195,12 +222,19 @@ This repo now includes read-first tools aimed at mixing/mastering assistance (wi
 - `get_send_matrix`: compact view of which tracks feed which returns and by how much
 - `infer_mix_context_tags` / `save_mix_context_tags`: semantic roles like `lead_vocal`, `drums_bus`, `main_reverb`
 - `build_mix_context_profile`: merges explicit tags with deterministic name-based inference
-- `analyze_mastering_file`: loudness, true peak, stereo correlation/width, mono fold-down deltas, clipping count
+- `analyze_mastering_file`: loudness, true peak, stereo correlation/width, mono fold-down deltas, clipping count, exact peak timestamps, top near-clip events, and explicit analysis pipeline metadata
 - `build_mix_master_context`: LLM-ready payload with stage readiness for mix prep, submix, exports, and mastering
 - `enumerate_project_automation_exhaustive`: canonical ALS-first saved-state automation inventory (paged, completeness diagnostics)
 - `get_automation_target_points`: drill-down exact point payload for one exhaustive inventory target
 
 `build_mix_master_context` is designed to tell an LLM what is present, what is missing, and which MCP tools to call next.
+
+### Device Inventory Notes
+
+- `get_device_inventory.roots` is intentionally **list-only** (for example: `["Audio Effects"]`).
+- Root aliases are normalized (for example `Max_for_live`, `max for live`, `audio_effects`).
+- Default `response_mode` is `compact` with paging (`offset`, `limit`); use `response_mode="full"` for exhaustive lists.
+- `audio_only=true` filters inventory to audio workflows (Audio Effects, Plugins, and optional Max for Live audio effects).
 
 ### Session Clip Envelope Coverage
 
